@@ -1,6 +1,7 @@
 add_executable(chronos_tests
   test_types.cpp
   test_memory_pool.cpp
+  test_order_book.cpp
 )
 target_link_libraries(chronos_tests PRIVATE chronos_core Catch2::Catch2WithMain)
 
