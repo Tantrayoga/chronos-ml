@@ -182,35 +182,17 @@ public:
                 curr_order_idx = next_idx;
             }
 
-            // The inner loop above only unlinks *orders* from the level's
-            // queue — it never touches the `price_levels` array itself. If
-            // every resting order at this price got fully filled, head_idx
-            // is now kInvalidIndex, but the (now-empty) PriceLevel slot is
-            // still sitting in the array and `find_price_level` would still
-            // "find" it. So: if the level is empty, erase its slot the same
-            // way `insert_price_level` inserts one — shift everything above
-            // it down by one and shrink the count.
             const bool level_emptied = (level.head_idx == kInvalidIndex);
             if (level_emptied) {
                 remove_price_level(current_level_idx);
             }
-
-            // Advancing the index has to account for the shift above.
-            //   Buy taker walks forward (toward higher indices / the Sell
-            //   block). If we just erased the level at current_level_idx,
-            //   everything above it slid down into that same index — so the
-            //   *next* level to check is already at current_level_idx, and
-            //   incrementing would skip it. Only advance if we didn't erase.
-            //   Sell taker walks backward (toward index 0 / the Buy block).
-            //   A removal at current_level_idx never moves anything below
-            //   it, so decrementing is always correct regardless of removal.
             if (taker_side == Side::Buy) {
                 if (!level_emptied) {
                     ++current_level_idx;
                 }
             } else {
                 if (current_level_idx == 0) {
-                    break; // would underflow — nothing lower to check anyway
+                    break; 
                 }
                 --current_level_idx;
             }

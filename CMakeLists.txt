@@ -43,6 +43,8 @@ target_compile_options(chronos_core INTERFACE
   -O3 -march=native -fno-omit-frame-pointer -Wall -Wextra -Wpedantic
 )
 
+add_subdirectory(src)
+
 enable_testing()
 add_subdirectory(tests)
 add_subdirectory(benchmarks)
