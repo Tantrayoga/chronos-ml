@@ -6,6 +6,8 @@
 #include <cstdint>
 
 #include "chronos/memory_pool.h"
+#include "chronos/ml_inference.h"
+#include "chronos/telemetry.h"
 #include "chronos/types.h"
 
 namespace chronos {
@@ -18,12 +20,30 @@ public:
         Side side = Side::Buy;
         uint32_t head_idx = kInvalidIndex;
         uint32_t tail_idx = kInvalidIndex;
+        // Sum of (quantity - filled_qty) across every order resting at this
+        // level, maintained incrementally at every append/fill/cancel. This
+        // is what makes top-of-book feature extraction O(kObiDepth) instead
+        // of O(orders per level) — the alternative (walking the queue to sum
+        // remaining quantity on every book update) would put an unbounded
+        // loop on the inference hot path.
+        uint64_t resting_qty = 0;
     };
 
     // Active levels are grouped by side and sorted by price within each side.
     std::array<PriceLevel, MaxPriceLevels> price_levels{};
     size_t active_price_level_count = 0;
     FixedObjectPool<Order, MaxOrders> orders;
+
+    // Stateless — safe to keep by value with zero overhead (just the fixed
+    // weight array, no heap, no per-instance state).
+    InferenceEngine inference_engine{};
+
+    // Optional injection point for asynchronous logging of book-state and
+    // inference events. Left null by default so a caller who doesn't care
+    // about telemetry pays exactly zero cost (every hook below is a single
+    // pointer-null check). The pointed-to buffer's lifetime is owned by the
+    // caller, not the book.
+    SignalRingBuffer* telemetry_sink = nullptr;
 
     uint32_t find_price_level(Side side, uint64_t price) const noexcept {
         const size_t index = lower_bound_level(side, price);
@@ -53,6 +73,9 @@ public:
     }
 
     void append_order(uint32_t level_idx, uint32_t order_idx) noexcept {
+        const Order& appended = orders.get(order_idx);
+        price_levels[level_idx].resting_qty += (appended.quantity - appended.filled_qty);
+
         orders.get(order_idx).next_idx = kInvalidIndex;
         if(price_levels[level_idx].tail_idx == kInvalidIndex){
             orders.get(order_idx).prev_idx = kInvalidIndex;
@@ -101,11 +124,16 @@ public:
         order.side = static_cast<char>(side);
         order.flags = static_cast<uint8_t>(OrderFlags::Active);
 
+        if (telemetry_sink != nullptr) {
+            telemetry_sink->push(order_id, TelemetryStage::OrderReceived);  // T1
+        }
+
         match(order_idx);
 
         // Fully filled by match() — nothing left to rest on the book.
         if (order.filled_qty >= order.quantity) {
             orders.deallocate(order_idx);
+            on_book_state_changed(order_id);
             return order_idx;
         }
 
@@ -115,6 +143,7 @@ public:
             return kInvalidIndex;
         }
         append_order(level_idx, order_idx);
+        on_book_state_changed(order_id);
         return order_idx;
     }
 
@@ -123,8 +152,22 @@ public:
     // sits on (callers already know it from routing, so we avoid a redundant
     // lookup here).
     void cancel_order(uint32_t level_idx, uint32_t order_idx) noexcept {
+        const Order& canceled = orders.get(order_idx);
+        const uint64_t canceled_order_id = canceled.order_id;
+        price_levels[level_idx].resting_qty -= (canceled.quantity - canceled.filled_qty);
+
         unlink_order(level_idx, order_idx);
         orders.deallocate(order_idx);
+
+        // Same cleanup match() performs after a sweep drains a level: if
+        // this was the last resting order at the price, the PriceLevel slot
+        // itself must be erased, or find_price_level() would keep reporting
+        // a price with zero resting quantity as still active.
+        if (price_levels[level_idx].head_idx == kInvalidIndex) {
+            remove_price_level(level_idx);
+        }
+
+        on_book_state_changed(canceled_order_id);
     }
 
     // Convenience overload for callers that only have the order's id/side/price
@@ -141,10 +184,12 @@ public:
     void match(uint32_t taker_idx) noexcept {
         Order& taker = orders.get(taker_idx);
         const Side taker_side = static_cast<Side>(taker.side);
+        const uint64_t taker_order_id = taker.order_id;
+        bool crossed_any = false;
 
         size_t sell_boundary = lower_bound_level(Side::Sell, 0);
         size_t current_level_idx;
-        
+
         if(taker_side == Side::Buy){
             current_level_idx = sell_boundary;
         }
@@ -152,7 +197,7 @@ public:
             if(sell_boundary == 0) return;
             current_level_idx = sell_boundary - 1;
         }
-        
+
         while(taker.filled_qty < taker.quantity){
             if (current_level_idx >= active_price_level_count) break;
 
@@ -160,6 +205,11 @@ public:
 
             if(taker_side == Side::Buy && taker.price < level.price) break;
             if(taker_side == Side::Sell && taker.price > level.price) break;
+
+            if (!crossed_any && telemetry_sink != nullptr) {
+                telemetry_sink->push(taker_order_id, TelemetryStage::SpreadCrossed);  // T2
+            }
+            crossed_any = true;
 
             uint32_t curr_order_idx = level.head_idx;
             while (curr_order_idx != kInvalidIndex && taker.filled_qty < taker.quantity){
@@ -173,6 +223,7 @@ public:
                 uint32_t trade_qty = std::min(taker_rem, resting_rem);
                 taker.filled_qty += trade_qty;
                 resting.filled_qty += trade_qty;
+                level.resting_qty -= trade_qty;
 
                 if(resting.filled_qty == resting.quantity){
                     unlink_order(current_level_idx, curr_order_idx);
@@ -192,16 +243,69 @@ public:
                 }
             } else {
                 if (current_level_idx == 0) {
-                    break; 
+                    break;
                 }
                 --current_level_idx;
             }
 
         }
 
+        if (crossed_any && telemetry_sink != nullptr) {
+            telemetry_sink->push(taker_order_id, TelemetryStage::OrdersUnlinked);  // T3
+        }
     }
 
 private:
+    // Reads the top kObiDepth levels on each side directly from the already-
+    // sorted `price_levels` array — no search, no queue walk (that's what
+    // `resting_qty` buys us). This is the only place the matching engine
+    // touches the inference module's types, keeping the coupling to a single
+    // narrow seam.
+    BookFeatures extract_top_of_book_features() const noexcept {
+        BookFeatures features{};
+
+        const size_t sell_boundary = lower_bound_level(Side::Sell, 0);
+
+        size_t asks_remaining = active_price_level_count - sell_boundary;
+        size_t ask_idx = sell_boundary;
+        for (size_t depth = 0; depth < kObiDepth && asks_remaining > 0; ++depth) {
+            features.ask_qty[depth] = static_cast<uint32_t>(price_levels[ask_idx].resting_qty);
+            ++ask_idx;
+            --asks_remaining;
+        }
+
+        size_t bids_remaining = sell_boundary;
+        size_t bid_idx = sell_boundary;
+        for (size_t depth = 0; depth < kObiDepth && bids_remaining > 0; ++depth) {
+            --bid_idx;
+            features.bid_qty[depth] = static_cast<uint32_t>(price_levels[bid_idx].resting_qty);
+            --bids_remaining;
+        }
+
+        if (sell_boundary > 0 && sell_boundary < active_price_level_count) {
+            const uint64_t best_bid_price = price_levels[sell_boundary - 1].price;
+            const uint64_t best_ask_price = price_levels[sell_boundary].price;
+            features.spread = (best_ask_price > best_bid_price) ? (best_ask_price - best_bid_price) : 0;
+        }
+
+        return features;
+    }
+
+    // Central hook for "the book changed shape" — called after any add,
+    // fill, or cancel that could move top-of-book metrics. Recomputes
+    // features and runs inference in O(kObiDepth) time (no heap, no
+    // dynamic dispatch), then hands the result to the telemetry sink for
+    // asynchronous consumption. A null sink makes this a single branch.
+    void on_book_state_changed(uint64_t trigger_order_id) noexcept {
+        if (telemetry_sink == nullptr) {
+            return;
+        }
+        const BookFeatures features = extract_top_of_book_features();
+        const PricePrediction prediction = inference_engine.predict(features);
+        telemetry_sink->push(trigger_order_id, TelemetryStage::SignalEmitted,
+                              static_cast<int8_t>(prediction));  // T4
+    }
+
     // Erases the PriceLevel at `index`, compacting the array so no gap is
     // left — the mirror image of the shift-up in insert_price_level().
     void remove_price_level(size_t index) noexcept {

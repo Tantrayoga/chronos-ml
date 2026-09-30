@@ -4,6 +4,7 @@ add_executable(chronos_tests
   test_order_book.cpp
   test_benchmark.cpp
   test_ml_inference.cpp
+  test_integration.cpp
 )
 target_link_libraries(chronos_tests PRIVATE chronos_core chronos_impl Catch2::Catch2WithMain)
 

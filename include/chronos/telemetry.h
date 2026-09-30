@@ -15,12 +15,18 @@ enum class TelemetryStage : uint8_t {
     OrderReceived = 0,   // T1: order handed to the book
     SpreadCrossed = 1,   // T2: matching determined the order crosses
     OrdersUnlinked = 2,  // T3: resting orders removed from the queue/pool
+    SignalEmitted = 3,   // T4: inference ran against the post-update book
 };
 
 struct TelemetryEvent {
     uint64_t order_id;
     uint64_t timestamp_ns;
     TelemetryStage stage;
+    // Only meaningful when stage == SignalEmitted (chronos::PricePrediction
+    // cast to int8_t); zero for every other stage. Kept as a raw int8_t
+    // rather than including ml_inference.h here, so telemetry stays
+    // decoupled from the inference module's type.
+    int8_t prediction = 0;
 };
 
 // Monotonic nanosecond timestamp. On ARM64 this reads the CPU's virtual
@@ -44,9 +50,9 @@ public:
     // recent trailing window of samples for tail-latency analysis, not a
     // permanent audit log, so we deliberately don't pay for overflow
     // handling here.
-    void push(uint64_t order_id, TelemetryStage stage) noexcept {
+    void push(uint64_t order_id, TelemetryStage stage, int8_t prediction = 0) noexcept {
         const size_t index = write_idx_.fetch_add(1, std::memory_order_relaxed) & kMask;
-        events_[index] = TelemetryEvent{order_id, now_ns(), stage};
+        events_[index] = TelemetryEvent{order_id, now_ns(), stage, prediction};
     }
 
     // Snapshot accessors for offline/benchmark analysis after the hot loop
@@ -71,5 +77,12 @@ struct LatencyStats {
 // an O(n log n) offline analysis step — it is never called from the hot
 // matching path, only after a benchmark run has collected its samples.
 LatencyStats compute_latency_stats(std::vector<uint64_t>& samples_ns) noexcept;
+
+// Fixed-capacity ring buffer used to sink hot-path signals (order lifecycle
+// events, inference predictions) for asynchronous/offline consumption. A
+// single concrete alias — rather than letting every OrderBook<> instantiate
+// its own template capacity — keeps the sink's type stable regardless of the
+// book's own size parameters, so it can be injected as a plain pointer.
+using SignalRingBuffer = LatencyRingBuffer<4096>;
 
 }  // namespace chronos
