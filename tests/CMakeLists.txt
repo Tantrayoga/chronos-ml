@@ -8,6 +8,7 @@ add_executable(chronos_tests
   test_ml_inference.cpp
   test_integration.cpp
   test_spsc_queue.cpp
+  test_threading.cpp
 )
 target_link_libraries(chronos_tests PRIVATE chronos_core chronos_impl Catch2::Catch2WithMain Threads::Threads)
 
