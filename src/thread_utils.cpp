@@ -29,7 +29,9 @@ bool set_thread_affinity_tag(uint32_t tag) noexcept {
     // SPSC queue); threads with different tags are told to prefer distinct
     // clusters (useful when they'd otherwise evict each other's working
     // set from a shared cache). The kernel is free to ignore the hint
-    // entirely under scheduling pressure.
+    // entirely under scheduling pressure, and on Apple Silicon it rejects
+    // the policy with KERN_NOT_SUPPORTED — callers must treat a false
+    // return as the normal case on arm64, not an error.
     thread_affinity_policy_data_t policy{static_cast<integer_t>(tag)};
     const thread_t self = pthread_mach_thread_np(pthread_self());
     const kern_return_t result = thread_policy_set(

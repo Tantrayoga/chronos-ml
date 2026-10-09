@@ -28,6 +28,12 @@ bool elevate_thread_qos() noexcept;
 // clusters (minimizing cache contention between unrelated hot loops).
 // Returns true if the policy call succeeded — success only means the
 // kernel accepted the hint, not that it will always honor it.
+//
+// On Apple Silicon the kernel rejects this policy outright with
+// KERN_NOT_SUPPORTED (verified on M4 Pro / macOS 15.5), so this returns
+// false there; QoS class is the only placement lever XNU honors on arm64.
+// The call is kept because it is accepted on Intel Macs and costs nothing
+// when refused.
 bool set_thread_affinity_tag(uint32_t tag) noexcept;
 
 // Sets the calling thread's name (visible in Instruments, lldb, and

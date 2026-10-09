@@ -7,8 +7,10 @@
 #include <unistd.h>
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <memory>
 #include <string>
@@ -148,10 +150,59 @@ void render_dashboard(const ReplayBook& book, size_t processed, size_t rejected,
     std::fflush(stdout);
 }
 
+struct Options {
+    std::string csv_path = "latency.csv";
+    unsigned pace_ms = 0;
+};
+
+void print_usage(const char* program) {
+    std::fprintf(stderr,
+                 "usage: %s [--pace MS] [CSV_PATH]\n"
+                 "  --pace MS   pause MS milliseconds after each dashboard frame so the\n"
+                 "              replay can be watched; paused time is excluded from\n"
+                 "              throughput and from every latency sample\n"
+                 "  CSV_PATH    per-message latency output (default: latency.csv)\n",
+                 program);
+}
+
+bool parse_options(int argc, char** argv, Options& options) {
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "-h" || arg == "--help") {
+            return false;
+        }
+        if (arg == "--pace") {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "error: --pace needs a value in milliseconds\n");
+                return false;
+            }
+            const std::string value = argv[++i];
+            char* end = nullptr;
+            const unsigned long parsed = std::strtoul(value.c_str(), &end, 10);
+            if (value.empty() || *end != '\0' || parsed > 60'000) {
+                std::fprintf(stderr, "error: --pace expects 0-60000 ms, got '%s'\n", value.c_str());
+                return false;
+            }
+            options.pace_ms = static_cast<unsigned>(parsed);
+        } else if (!arg.empty() && arg[0] == '-') {
+            std::fprintf(stderr, "error: unknown option '%s'\n", arg.c_str());
+            return false;
+        } else {
+            options.csv_path = arg;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    const std::string csv_path = argc > 1 ? argv[1] : "latency.csv";
+    Options options;
+    if (!parse_options(argc, argv, options)) {
+        print_usage(argv[0]);
+        return 2;
+    }
+    const std::string& csv_path = options.csv_path;
     const bool interactive = isatty(STDOUT_FILENO) != 0;
 
     std::printf("generating %zu wire messages...\n", kMessageCount);
@@ -166,6 +217,7 @@ int main(int argc, char** argv) {
     size_t rejected = 0;
     const uint64_t replay_start_ns = chronos::now_ns();
     uint64_t replay_end_ns = replay_start_ns;
+    uint64_t paused_ns = 0;  // written only by the matcher, read after join
 
     std::thread ingress([&]() {
         chronos::set_thread_name("chronos-ingress");
@@ -217,7 +269,18 @@ int main(int argc, char** argv) {
             ++processed;
 
             if (processed % kDashboardInterval == 0) {
-                render_dashboard(*book, processed, rejected, chronos::now_ns() - replay_start_ns, interactive);
+                render_dashboard(*book, processed, rejected, chronos::now_ns() - replay_start_ns - paused_ns,
+                                 interactive);
+                if (options.pace_ms > 0 && processed < kMessageCount) {
+                    // Sleeping here never lands inside a latency sample (the
+                    // next t_start is taken after we wake), but it does let
+                    // caches and the core's clock speed cool down, so the
+                    // first few messages after each pause can run slower.
+                    // Use an unpaced run for the published benchmark numbers.
+                    const uint64_t pause_start = chronos::now_ns();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(options.pace_ms));
+                    paused_ns += chronos::now_ns() - pause_start;
+                }
             }
         }
         replay_end_ns = chronos::now_ns();
@@ -235,7 +298,7 @@ int main(int argc, char** argv) {
     csv.close();
 
     const chronos::LatencyStats stats = chronos::compute_latency_stats(latencies_ns);
-    const double seconds = static_cast<double>(replay_end_ns - replay_start_ns) / 1e9;
+    const double seconds = static_cast<double>(replay_end_ns - replay_start_ns - paused_ns) / 1e9;
 
     std::printf("replay complete: %zu messages in %.3f s (%.2f M msg/s), %zu rejected\n", kMessageCount, seconds,
                 static_cast<double>(kMessageCount) / seconds / 1e6, rejected);

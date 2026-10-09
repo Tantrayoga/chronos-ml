@@ -1,106 +1,183 @@
 # Chronos-ML
 
-A zero-allocation, low-latency limit order book (LOB) matching engine in C++20, with an integrated branchless ML inference signal, built and benchmarked on Apple Silicon (ARM64).
+A zero-allocation, low-latency limit order book (LOB) matching engine in C++20, with an inline order-book-imbalance signal, built and measured on Apple Silicon.
 
-## Architecture
+On an Apple M4 Pro, the replay harness streams **1,000,000 binary wire messages** from an ingress thread through a lock-free queue into the matching engine at **~12.4M messages/s**, with a per-message latency (decode + match + book update) of **p50 ≈ 42 ns, p99 ≈ 268 ns, p99.9 ≈ 458 ns**.
 
-### Zero-allocation object pool
+![Terminal dashboard during a 1M-message replay](docs/replay_demo.gif)
 
-`FixedObjectPool<T, Capacity>` ([include/chronos/memory_pool.h](include/chronos/memory_pool.h)) allocates a `std::array<T, Capacity>` once at construction and hands out slots via an index-based free-list stack. `allocate()` and `deallocate()` are both O(1) and never touch the heap after startup — there is no `malloc`/`free` anywhere on the order lifecycle path.
+*Live dashboard from `chronos_replay --pace 400`. Pausing slows the replay so it can be watched; the paused time is not counted in throughput or latency.*
 
-### Intrusive doubly-linked queues
+![Latency distribution for a 1M-message replay](docs/latency_histogram.png)
 
-Orders are 40-byte, 8-byte-aligned structs (`include/chronos/types.h`) that link to each other by **pool index**, not by pointer:
+---
 
-```cpp
-struct Order {
-    uint64_t order_id;
-    uint64_t price;
-    uint32_t quantity;
-    uint32_t filled_qty;
-    uint32_t next_idx;   // intrusive doubly-linked list
-    uint32_t prev_idx;
-    char side;
-    uint8_t flags;
-    uint8_t padding[6];
-};
+## Contents
+
+- [System architecture](#system-architecture)
+- [Apple Silicon hardware tuning](#apple-silicon-hardware-tuning)
+- [Inline ML signal](#inline-ml-signal)
+- [Performance benchmarks](#performance-benchmarks)
+- [Building, testing, and running](#building-testing-and-running)
+- [Limitations and honest caveats](#limitations-and-honest-caveats)
+
+---
+
+## System architecture
+
+```
+ raw bytes          SPSCQueue<Packet, 65536>          OrderBook<4096, 1M>
+┌──────────┐  push  ┌──────────────────────┐  front  ┌──────────────────────────┐
+│ ingress  │ ─────▶ │ head_ │ tail_ │ ring │ ──────▶ │ parse_wire_order (BE→LE) │
+│ thread   │        │ (own  │ (own  │      │         │ add_order → match()      │
+└──────────┘        │ line) │ line) │      │         │ on_book_state_changed()  │
+                    └──────────────────────┘         │   └▶ OBI (NEON) → signal │
+                                                     └──────────────────────────┘
 ```
 
-Each price level's FIFO queue is threaded through these indices directly into the object pool's backing array. There's no separate node allocation for the queue structure — the order *is* the node, and traversal is index math into an array that's already resident and cache-friendly, rather than pointer-chasing through independently allocated heap nodes.
+### Zero-allocation object pool — [`memory_pool.h`](include/chronos/memory_pool.h)
 
-### Flat, sorted price-level array
+`FixedObjectPool<T, Capacity>` allocates a `std::array<T, Capacity>` once and hands out slots through an index-based free-list stack. `allocate()` and `deallocate()` are O(1) and never touch the heap after construction.
 
-`OrderBook<MaxPriceLevels, MaxOrders>` ([include/chronos/order_book.h](include/chronos/order_book.h)) stores all price levels in a single `std::array<PriceLevel, MaxPriceLevels>`, sorted by `(side, price)` ascending. This gives two properties the matching engine leans on directly:
+### Cache-sized orders with intrusive queues — [`types.h`](include/chronos/types.h)
 
-- **Binary search** (`lower_bound_level`) finds any price level in O(log n) without a tree structure.
-- **Best bid/ask are adjacent in memory** — Buy levels occupy a contiguous front block, Sell levels a contiguous back block, so the best bid (last Buy entry) and best ask (first Sell entry) sit at a single boundary index. Sweeping the book outward from the best price is just walking that boundary index in one direction, with no re-search per level.
+`Order` is exactly 40 bytes with natural 8-byte alignment (enforced by `static_assert`), so no order ever straddles a cache line in the flat pool array. Orders link to each other by **32-bit pool index** rather than pointer: each price level's FIFO queue is threaded through `prev_idx`/`next_idx` directly inside the pool, so the order *is* the list node and no separate node allocation exists.
 
-Each `PriceLevel` also tracks `resting_qty` — the sum of remaining quantity across every order resting at that level — maintained incrementally on every append, fill, and cancel. This is what keeps top-of-book feature extraction O(depth) instead of requiring a queue walk on every book update.
+### Flat, sorted price-level array — [`order_book.h`](include/chronos/order_book.h)
+
+All levels live in one `std::array<PriceLevel, MaxPriceLevels>` sorted by `(side, price)`. Buy levels form a contiguous front block and Sell levels a contiguous back block, so the best bid and best ask sit on either side of a single boundary index. Sweeping the book is a linear walk outward from that boundary, which the hardware prefetcher handles well, with no tree rebalancing and no pointer chasing.
+
+Each `PriceLevel` keeps an incrementally maintained `resting_qty`, updated on every append, fill, and cancel, so reading top-N depth for the ML features is O(N) instead of a walk over every resting order.
 
 ### Matching engine
 
-`add_order()`, `cancel_order()`, and `match()` implement price-time priority matching: an aggressive order crosses the spread against the best opposite price levels, filling resting orders in FIFO order (oldest first) via `std::min(taker_remaining, resting_remaining)`. Fully-filled resting orders are unlinked and returned to the pool; fully-drained price levels are compacted out of the array the same way they were inserted — an insert shifts entries up to make room, a removal shifts them back down to close the gap.
+`add_order()` → `match()` implements price-time priority: an aggressive order crosses the spread against the best opposite levels, fills FIFO within each level using `std::min(taker_remaining, resting_remaining)` (lowered to a conditional select, not a branch), unlinks fully filled orders back to the pool, and compacts drained levels out of the array. `cancel_order()` uses the same unlink and compaction path.
 
-## Telemetry & benchmark methodology
+### Lock-free SPSC queue — [`spsc_queue.h`](include/chronos/spsc_queue.h)
 
-### Lock-free ring buffer
+`SPSCQueue<T, Capacity>` decouples ingress from matching:
 
-`LatencyRingBuffer<Capacity>` ([include/chronos/telemetry.h](include/chronos/telemetry.h)) is a single-producer/single-consumer ring buffer for logging pipeline events. With exactly one writer, a push is a single relaxed atomic increment (`fetch_add`) plus a bitmask for wraparound (`Capacity` must be a power of two) — no compare-and-swap retry loop, no mutex, no syscall.
+- **False-sharing isolation:** `head_`, `tail_`, and the storage ring each get their own `alignas(128)` cache line. 128 bytes is the line size the M4 Pro reports (`hw.cachelinesize`), not the 64 bytes common on x86.
+- **Minimal ordering:** each side loads its own index `relaxed`, loads the other side's index `acquire`, and publishes with `release`. There is no `seq_cst` anywhere on the path.
+- **Power-of-two masking:** wraparound is `index & (Capacity - 1)`, not `%`.
+- **Zero-copy consume:** `front()` / `pop_front()` let the matcher decode a packet in place inside the ring slot.
 
-Four checkpoints are recorded per order lifecycle:
+Verified by a two-thread stress test that moves 1,000,000 sequenced items with zero loss and zero reordering.
 
-| Stage | Meaning |
+### Zero-copy binary protocol — [`binary_parser.h`](include/chronos/binary_parser.h)
+
+`WireOrder` messages use a fixed 22-byte, big-endian layout (ITCH/OUCH style). `parse_wire_order()` extracts each field with fixed-size `std::memcpy`, which avoids both misaligned loads and strict-aliasing UB and compiles to the same load instructions a pointer cast would produce. Byte order is converted with `__builtin_bswap64/32` (a single `REV` instruction on ARM64). `encode_wire_order()` is the exact inverse; a round-trip test pins the format.
+
+### Telemetry — [`telemetry.h`](include/chronos/telemetry.h)
+
+`now_ns()` reads the ARM64 virtual counter (`CNTVCT_EL0`) directly with `mrs`, with no syscall. `LatencyRingBuffer` is a fixed-capacity, single-writer event log recording the T1–T4 lifecycle checkpoints (received → crossed → unlinked → signal emitted) through an optional, null-by-default sink on the book.
+
+---
+
+## Apple Silicon hardware tuning
+
+### Thread QoS and naming — [`thread_utils.h`](include/chronos/thread_utils.h)
+
+macOS has no `sched_setaffinity`, `taskset`, or `isolcpus`. The XNU scheduler keeps thread placement for itself so it can balance P-cores, E-cores, and thermals, and exposes *intent* to applications instead of hard pinning.
+
+| Utility | Mechanism | Result on M4 Pro / macOS 15.5 |
+|---|---|---|
+| `elevate_thread_qos()` | `pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE)` | **Accepted.** The strongest scheduling-priority signal available to user code. |
+| `set_thread_name()` | `pthread_setname_np` (calling thread only on macOS) | **Accepted.** Threads appear as `chronos-ingress` / `chronos-matcher` in Instruments and lldb. |
+| `set_thread_affinity_tag()` | Mach `thread_policy_set(THREAD_AFFINITY_POLICY)` | **Rejected with `KERN_NOT_SUPPORTED`.** Apple Silicon does not implement affinity tags; the call is kept for Intel Macs and degrades to a no-op. |
+
+So on Apple Silicon, QoS class is the only real placement lever. The engine does not rely on the affinity tag for correctness or for its benchmark numbers.
+
+### ARM NEON SIMD — [`ml_simd.h`](include/chronos/ml_simd.h)
+
+The order book imbalance (OBI) feature is computed with NEON intrinsics. Four price levels of bid and ask volume load into `uint32x4_t` registers (`vld1q_u32`), convert to `float32x4_t` in one instruction (`vcvtq_f32_u32`), and produce four lanes of `bid − ask` and `bid + ask` with one `vsubq_f32` and one `vaddq_f32`. A single horizontal reduction (`vaddvq_f32` → `faddp`) per call collapses the lanes, and the fifth level is handled by a scalar tail. The compiled object contains `ucvtf.4s`, `fsub.4s`, `fadd.4s`, and `faddp` as expected. A 10,000-trial randomized test checks the result against a scalar reference.
+
+---
+
+## Inline ML signal
+
+[`ml_inference.h`](include/chronos/ml_inference.h)
+
+- **Feature:** `OBI = (Σbid − Σask) / (Σbid + Σask)` over the top 5 levels per side, bounded in `[−1, 1]`.
+- **Model:** a fixed `constexpr` linear model over `{OBI, spread}`, thresholded into `{Down, Flat, Up}` with arithmetic (`(score > up) − (score < down)`) that lowers to `cset`, not a conditional branch.
+- **Wiring:** every book mutation (insert, fill, cancel) calls `on_book_state_changed()`, which recomputes features and runs inference in constant time. With no telemetry sink attached, the hook costs a single null check.
+
+The weights are hand-set placeholders, not a trained model; see [Limitations](#limitations-and-honest-caveats).
+
+---
+
+## Performance benchmarks
+
+**Environment:** Apple M4 Pro (8P + 4E cores, 16 MB L2 per P-cluster, 128-byte cache line), macOS 15.5, Apple clang 17, `-O3 -march=native`, Release build.
+
+### End-to-end market replay — [`src/replay_harness.cpp`](src/replay_harness.cpp)
+
+1,000,000 pre-generated, deterministic ITCH-style messages (about 30% aggressive), streamed ingress thread → `SPSCQueue` → matching thread. Latency is measured per message around **decode + `add_order` (match, book update, inference hook)**. Dashboard rendering is excluded from the timing window.
+
+| Metric | Value |
 |---|---|
-| `OrderReceived` (T1) | Order handed to the book |
-| `SpreadCrossed` (T2) | Matching determined the order crosses the opposite book |
-| `OrdersUnlinked` (T3) | Resting orders removed from the queue/pool during a sweep |
-| `SignalEmitted` (T4) | Post-update inference ran and produced a prediction |
+| Throughput | **~12.4M messages/s** (1M messages in ~0.081 s) |
+| Rejected orders | 0 |
+| p50 | 42 ns |
+| p90 | 125 ns |
+| p99 | 268 ns |
+| p99.9 | 458 ns |
+| max | ~14 µs |
+| Live price levels at end | ~600 |
 
-### Timestamping
+### Component benchmarks — [`tests/test_benchmark.cpp`](tests/test_benchmark.cpp)
 
-`now_ns()` reads the ARM64 virtual counter register (`CNTVCT_EL0`) directly via inline assembly, converting ticks to nanoseconds using the counter frequency (`CNTFRQ_EL0`) — avoiding the syscall overhead a portable `clock_gettime`-backed clock would add on the very path being measured. A `std::chrono::high_resolution_clock` fallback is used on non-ARM64 targets.
+| Scenario | Result |
+|---|---|
+| Resting insert, 10,000 orders across 500 levels | p50 ≈ 42–83 ns, p99 ≈ 84–125 ns |
+| Single taker sweeping ~250 levels / 5,000 resting orders (50,000 units) | ≈ 40–70 µs total (≈ 8–14 ns per resting order consumed) |
 
-### Latency profile (from `tests/test_benchmark.cpp`, flooding 10,000 resting orders across 500 price levels)
+### Reading the distribution
 
-```
-[bench] insertion latency (ns) over 10000 samples: mean=56.6 median=42.0 p99=84.0
-[bench] single sweeping taker match: 51994 ns (requested fill 50000 units)
-```
+- **Timer resolution sets the floor.** Apple Silicon's counter runs at 24 MHz (`hw.tbfrequency`), so one tick is about 41.67 ns. A reported p50 of 42 ns means "within one tick", and the ~5% of samples at 0 ns completed inside a single tick. Sub-tick differences are not measurable with this clock, and `plot_latency.py` bins on the detected tick to avoid aliasing artifacts.
+- **The tail shoulder is the OS, not the engine.** The CCDF has a small plateau around 1–3 µs at a frequency of about 10⁻⁴. The hot path does no allocation and no locking, so this is consistent with scheduler preemption, interrupts, or first-touch page faults landing inside a sample. QoS elevation reduces how often this happens but cannot eliminate it on macOS.
 
-Percentiles (p50/p99), not the arithmetic mean, are the metric that matters: a strategy's edge is threatened by its worst-case behavior, not its typical case, since that's precisely when the market has moved fast enough that a slow fill costs money. `compute_latency_stats()` sorts the sample set and indexes directly into the tail (`0.99 * n`) rather than approximating it from the mean.
-
-## ML inference integration
-
-### Order Book Imbalance (OBI)
-
-`InferenceEngine::compute_obi()` ([include/chronos/ml_inference.h](include/chronos/ml_inference.h)) computes:
-
-```
-OBI = (Σ bid_qty - Σ ask_qty) / (Σ bid_qty + Σ ask_qty)
-```
-
-over the top `kObiDepth` (5) price levels on each side, bounded in `[-1, 1]`. Positive values indicate resting buy-side pressure dominates the visible book.
-
-### Branchless prediction
-
-`predict()` applies a fixed, compile-time linear model over `{obi, spread}` and thresholds the result into `{Down, Flat, Up}` without an `if/else` chain:
-
-```cpp
-const int is_up   = static_cast<int>(score > kUpThreshold);
-const int is_down = static_cast<int>(score < kDownThreshold);
-return static_cast<PricePrediction>(is_up - is_down);
-```
-
-Each comparison lowers to a compare-and-set instruction, not a conditional branch, so the three-way decision has no data-dependent branch for the predictor to mispredict. All weights (`kWeights`) are `constexpr`, and `BookFeatures` is a flat, fixed-size value type — the entire inference call is a handful of registers and multiply-adds, with zero heap allocation and deterministic O(1) latency.
-
-### Hot-path wiring
-
-`OrderBook` holds an `InferenceEngine` by value (stateless, zero overhead) and an optional `SignalRingBuffer* telemetry_sink`. Every state-changing operation — a resting insert, a match, a cancel — calls `on_book_state_changed()`, which recomputes top-of-book features and runs inference in O(kObiDepth) time. When `telemetry_sink` is `nullptr`, every hook is a single pointer check: callers who don't need telemetry pay nothing for it.
-
-## Building & testing
+Regenerate the figure yourself:
 
 ```sh
-cmake -S . -B build
-cmake --build build --target chronos_tests -j
-./build/tests/chronos_tests
+./build/src/chronos_replay latency.csv
+python3 -m pip install -r scripts/requirements.txt
+python3 scripts/plot_latency.py latency.csv -o docs/latency_histogram.png
 ```
+
+---
+
+## Building, testing, and running
+
+Requires CMake ≥ 3.25 and a C++20 compiler. Catch2 and Google Benchmark are fetched automatically.
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+
+./build/tests/chronos_tests        # 39 test cases, ~30k assertions
+./build/src/chronos_replay         # 1M-message replay + live terminal dashboard
+./build/src/chronos_replay --pace 400   # same, paused 400 ms per frame so it can be watched
+```
+
+| Test file | Covers |
+|---|---|
+| `test_types.cpp`, `test_memory_pool.cpp` | `Order` layout, pool allocate/free semantics |
+| `test_order_book.cpp` | FIFO links, level sorting, crossing, partial fills, multi-level sweeps |
+| `test_integration.cpp` | T1–T4 telemetry ordering, cancel compaction, null-sink behavior |
+| `test_spsc_queue.cpp` | FIFO, wraparound, full/empty, 1M-item two-thread stress |
+| `test_threading.cpp` | QoS / naming / affinity applied around a live SPSC pipeline |
+| `test_binary_parser.cpp` | Endianness swap, truncation, round-trip encode/parse, routing into the book |
+| `test_ml_inference.cpp`, `test_ml_simd.cpp` | OBI bounds, prediction thresholds, NEON vs. scalar equivalence |
+| `test_benchmark.cpp` | 10k-order insertion percentiles, deep sweep timing |
+
+---
+
+## Limitations and honest caveats
+
+- **Single instrument, limit orders only.** No IOC/FOK/stop/iceberg order types, no multi-symbol routing, no risk or position checks before matching.
+- **No network or persistence layer.** The replay generates bytes in memory; there is no socket I/O, no journaling, and no crash recovery.
+- **Cancels from the wire are parsed but not routed.** Resolving a `CancelOrder` message requires an order-id → pool-index map, which is not implemented yet.
+- **The model is a placeholder.** The linear weights are hand-set to demonstrate branchless, constant-time inference on the hot path. They are not fit to market data and carry no predictive claim.
+- **"Zero allocation" is by construction, not yet by enforcement.** Every hot-path structure is a fixed-size array allocated before the replay starts, but the build does not yet trap stray allocations (for example, with a debug `operator new` override) or run under ThreadSanitizer.
+- **Thread affinity is unavailable on Apple Silicon** (see above). Results reflect QoS elevation only.
