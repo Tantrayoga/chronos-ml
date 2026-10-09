@@ -101,4 +101,31 @@ inline bool parse_wire_order(const uint8_t* buffer, size_t length, WireOrder& ou
     return true;
 }
 
+// Inverse of parse_wire_order: serializes a host-endian WireOrder into the
+// big-endian wire layout. `out` must have room for kWireOrderSize bytes.
+// Same memcpy discipline as the parser — the destination is an arbitrary
+// byte buffer with no alignment guarantee.
+inline void encode_wire_order(const WireOrder& order, uint8_t* out) noexcept {
+    size_t offset = 0;
+
+    const uint8_t message_type_raw = static_cast<uint8_t>(order.message_type);
+    std::memcpy(out + offset, &message_type_raw, sizeof(message_type_raw));
+    offset += sizeof(message_type_raw);
+
+    const uint64_t order_id_be = __builtin_bswap64(order.order_id);
+    std::memcpy(out + offset, &order_id_be, sizeof(order_id_be));
+    offset += sizeof(order_id_be);
+
+    const uint64_t price_be = __builtin_bswap64(order.price);
+    std::memcpy(out + offset, &price_be, sizeof(price_be));
+    offset += sizeof(price_be);
+
+    const uint32_t quantity_be = __builtin_bswap32(order.quantity);
+    std::memcpy(out + offset, &quantity_be, sizeof(quantity_be));
+    offset += sizeof(quantity_be);
+
+    const uint8_t side_raw = static_cast<uint8_t>(order.side);
+    std::memcpy(out + offset, &side_raw, sizeof(side_raw));
+}
+
 }  // namespace chronos

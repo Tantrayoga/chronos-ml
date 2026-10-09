@@ -255,7 +255,37 @@ public:
         }
     }
 
-private:
+    struct TopOfBook {
+        bool has_bid = false;
+        bool has_ask = false;
+        uint64_t bid_price = 0;
+        uint64_t ask_price = 0;
+        uint64_t bid_qty = 0;
+        uint64_t ask_qty = 0;
+    };
+
+    // Best bid and best ask sit on either side of the Buy/Sell boundary in
+    // the sorted level array, so this is one binary search plus two direct
+    // reads — cheap enough to poll from a monitoring path without
+    // disturbing the matching thread's cache footprint.
+    TopOfBook top_of_book() const noexcept {
+        TopOfBook tob{};
+        const size_t sell_boundary = lower_bound_level(Side::Sell, 0);
+        if (sell_boundary > 0) {
+            const PriceLevel& best_bid = price_levels[sell_boundary - 1];
+            tob.has_bid = true;
+            tob.bid_price = best_bid.price;
+            tob.bid_qty = best_bid.resting_qty;
+        }
+        if (sell_boundary < active_price_level_count) {
+            const PriceLevel& best_ask = price_levels[sell_boundary];
+            tob.has_ask = true;
+            tob.ask_price = best_ask.price;
+            tob.ask_qty = best_ask.resting_qty;
+        }
+        return tob;
+    }
+
     // Reads the top kObiDepth levels on each side directly from the already-
     // sorted `price_levels` array — no search, no queue walk (that's what
     // `resting_qty` buys us). This is the only place the matching engine
@@ -291,6 +321,7 @@ private:
         return features;
     }
 
+private:
     // Central hook for "the book changed shape" — called after any add,
     // fill, or cancel that could move top-of-book metrics. Recomputes
     // features and runs inference in O(kObiDepth) time (no heap, no

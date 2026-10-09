@@ -25,6 +25,30 @@ TEST_CASE("parse_wire_order swaps big-endian wire bytes into host-endian fields"
     REQUIRE(parsed.side == chronos::WireSide::Sell);
 }
 
+TEST_CASE("encode_wire_order round-trips through parse_wire_order", "[binary_parser]") {
+    chronos::WireOrder original{};
+    original.message_type = chronos::WireMessageType::NewOrder;
+    original.order_id = 0x0102030405060708ULL;
+    original.price = 1'005'000;
+    original.quantity = 250;
+    original.side = chronos::WireSide::Sell;
+
+    std::array<uint8_t, chronos::kWireOrderSize> bytes{};
+    chronos::encode_wire_order(original, bytes.data());
+
+    // Big-endian on the wire: the most significant byte of order_id leads.
+    REQUIRE(bytes[1] == 0x01);
+    REQUIRE(bytes[8] == 0x08);
+
+    chronos::WireOrder parsed{};
+    REQUIRE(chronos::parse_wire_order(bytes.data(), bytes.size(), parsed));
+    REQUIRE(parsed.message_type == original.message_type);
+    REQUIRE(parsed.order_id == original.order_id);
+    REQUIRE(parsed.price == original.price);
+    REQUIRE(parsed.quantity == original.quantity);
+    REQUIRE(parsed.side == original.side);
+}
+
 TEST_CASE("parse_wire_order rejects a truncated buffer", "[binary_parser]") {
     const std::array<uint8_t, 10> short_buffer{};
     chronos::WireOrder parsed{};
