@@ -10,6 +10,7 @@ add_executable(chronos_tests
   test_spsc_queue.cpp
   test_threading.cpp
   test_binary_parser.cpp
+  test_ml_simd.cpp
 )
 target_link_libraries(chronos_tests PRIVATE chronos_core chronos_impl Catch2::Catch2WithMain Threads::Threads)
 
