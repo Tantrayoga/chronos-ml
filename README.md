@@ -2,7 +2,7 @@
 
 A zero-allocation, low-latency limit order book (LOB) matching engine in C++20, with an inline order-book-imbalance signal, built and measured on Apple Silicon.
 
-On an Apple M4 Pro, the replay harness streams **1,000,000 binary wire messages** from an ingress thread through a lock-free queue into the matching engine at **~12.4M messages/s**, with a per-message latency (decode + match + book update) of **p50 ≈ 42 ns, p99 ≈ 268 ns, p99.9 ≈ 458 ns**.
+On an Apple M4 Pro, the replay harness streams **1,000,000 binary wire messages** from an ingress thread through a lock-free queue into the matching engine at **~15.2M messages/s**, with a per-message latency (decode + match + book update) of **p50 ≈ 42 ns, p99 ≈ 209 ns, p99.9 ≈ 375 ns**. The same commit on a 2020 M1 runs at ~7.1M messages/s ([comparison](#m4-pro-vs-m1)).
 
 ![Terminal dashboard during a 1M-message replay](docs/replay_demo.gif)
 
@@ -57,7 +57,7 @@ Each `PriceLevel` keeps an incrementally maintained `resting_qty`, updated on ev
 
 `SPSCQueue<T, Capacity>` decouples ingress from matching:
 
-- **False-sharing isolation:** `head_`, `tail_`, and the storage ring each get their own `alignas(128)` cache line. 128 bytes is the line size the M4 Pro reports (`hw.cachelinesize`), not the 64 bytes common on x86.
+- **False-sharing isolation:** `head_`, `tail_`, and the storage ring each get their own `alignas(128)` cache line. 128 bytes is the line size both the M4 Pro and M1 report (`hw.cachelinesize`), not the 64 bytes common on x86.
 - **Minimal ordering:** each side loads its own index `relaxed`, loads the other side's index `acquire`, and publishes with `release`. There is no `seq_cst` anywhere on the path.
 - **Power-of-two masking:** wraparound is `index & (Capacity - 1)`, not `%`.
 - **Zero-copy consume:** `front()` / `pop_front()` let the matcher decode a packet in place inside the ring slot.
@@ -80,7 +80,7 @@ Verified by a two-thread stress test that moves 1,000,000 sequenced items with z
 
 macOS has no `sched_setaffinity`, `taskset`, or `isolcpus`. The XNU scheduler keeps thread placement for itself so it can balance P-cores, E-cores, and thermals, and exposes *intent* to applications instead of hard pinning.
 
-| Utility | Mechanism | Result on M4 Pro / macOS 15.5 |
+| Utility | Mechanism | Result on M4 Pro (macOS 15.5) and M1 (macOS 14.6.1) |
 |---|---|---|
 | `elevate_thread_qos()` | `pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE)` | **Accepted.** The strongest scheduling-priority signal available to user code. |
 | `set_thread_name()` | `pthread_setname_np` (calling thread only on macOS) | **Accepted.** Threads appear as `chronos-ingress` / `chronos-matcher` in Instruments and lldb. |
@@ -108,34 +108,54 @@ The weights are hand-set placeholders, not a trained model; see [Limitations](#l
 
 ## Performance benchmarks
 
-**Environment:** Apple M4 Pro (8P + 4E cores, 16 MB L2 per P-cluster, 128-byte cache line), macOS 15.5, Apple clang 17, `-O3 -march=native`, Release build.
+**Build:** commit `fc4596a`, Release (`-O3 -march=native`), compiled natively on each machine.
+
+**Method:** 5 unpaced runs of the replay per machine. Throughput is the median of the 5; percentiles come from run 3's full latency file via `plot_latency.py` (run 3 was within 1% of the median throughput on both machines). Both machines were plugged in, running from an editor terminal with everyday apps open, so these are typical-desktop numbers, not an isolated lab setup.
 
 ### End-to-end market replay — [`src/replay_harness.cpp`](src/replay_harness.cpp)
 
 1,000,000 pre-generated, deterministic ITCH-style messages (about 30% aggressive), streamed ingress thread → `SPSCQueue` → matching thread. Latency is measured per message around **decode + `add_order` (match, book update, inference hook)**. Dashboard rendering is excluded from the timing window.
 
-| Metric | Value |
-|---|---|
-| Throughput | **~12.4M messages/s** (1M messages in ~0.081 s) |
-| Rejected orders | 0 |
-| p50 | 42 ns |
-| p90 | 125 ns |
-| p99 | 268 ns |
-| p99.9 | 458 ns |
-| max | ~14 µs |
-| Live price levels at end | ~600 |
+### M4 Pro vs M1
+
+| Metric | M4 Pro | M1 | M4 Pro advantage |
+|---|---|---|---|
+| Throughput | **15.2M msg/s** | **7.1M msg/s** | 2.1× |
+| p50 | 42 ns | 125 ns | ~3× (M4 Pro is at the timer floor) |
+| p90 | 84 ns | 167 ns | 2.0× |
+| p99 | 209 ns | 500 ns | 2.4× |
+| p99.9 | 375 ns | 875 ns | 2.3× |
+| mean | 59 ns | 132 ns | 2.2× |
+| max (single worst message) | ~10 µs | ~30 µs | n/a |
+| Rejected orders | 0 | 0 | |
+| Throughput spread across 5 runs | 12.2–15.3M (first run slower, the rest within 1.3%) | 7.00–7.11M | |
+
+| Machine | M4 Pro | M1 |
+|---|---|---|
+| Cores | 8P + 4E | 4P + 4E |
+| L2 per P-cluster | 16 MB | 12 MB |
+| Cache line | 128 B | 128 B |
+| Timer | 24 MHz | 24 MHz |
+| macOS | 15.5 | 14.6.1 |
+| Compiler | Apple clang 17 | Apple clang 15 |
+
+The same code, unchanged, runs about 2.1–2.4× faster on the M4 Pro across throughput and the tail. Both chips report 128-byte cache lines, so the queue's `alignas(128)` padding is correct on both. **The comparison is not purely silicon:** the M1 is also two macOS releases and two Apple clang major versions behind, and some of the gap may come from the compiler.
+
+![Terminal dashboard on the M1](docs/replay_demo_m1.gif)
+
+*The same paced replay on the M1 (`--pace 400`). The book state at each checkpoint is identical to the M4 Pro run, because the feed is deterministic; only the timing differs.*
 
 ### Component benchmarks — [`tests/test_benchmark.cpp`](tests/test_benchmark.cpp)
 
-| Scenario | Result |
-|---|---|
-| Resting insert, 10,000 orders across 500 levels | p50 ≈ 42–83 ns, p99 ≈ 84–125 ns |
-| Single taker sweeping ~250 levels / 5,000 resting orders (50,000 units) | ≈ 40–70 µs total (≈ 8–14 ns per resting order consumed) |
+| Scenario | M4 Pro | M1 |
+|---|---|---|
+| Resting insert, 10,000 orders across 500 levels | p50 ≈ 42 ns, p99 ≈ 84 ns | p50 ≈ 125 ns, p99 ≈ 167 ns |
+| Single taker sweeping ~250 levels / 5,000 resting orders (50,000 units) | ≈ 39–40 µs (≈ 8 ns per resting order consumed) | ≈ 99 µs (≈ 20 ns per resting order consumed) |
 
 ### Reading the distribution
 
-- **Timer resolution sets the floor.** Apple Silicon's counter runs at 24 MHz (`hw.tbfrequency`), so one tick is about 41.67 ns. A reported p50 of 42 ns means "within one tick", and the ~5% of samples at 0 ns completed inside a single tick. Sub-tick differences are not measurable with this clock, and `plot_latency.py` bins on the detected tick to avoid aliasing artifacts.
-- **The tail shoulder is the OS, not the engine.** The CCDF has a small plateau around 1–3 µs at a frequency of about 10⁻⁴. The hot path does no allocation and no locking, so this is consistent with scheduler preemption, interrupts, or first-touch page faults landing inside a sample. QoS elevation reduces how often this happens but cannot eliminate it on macOS.
+- **Timer resolution sets the floor.** Both chips' counters run at 24 MHz (`hw.tbfrequency`), so one tick is about 41.67 ns and every sample is a whole number of ticks. The M4 Pro's p50 of 42 ns means "within one tick", and about 5% of its samples read 0 ns (they finished inside a single tick), so its true median is likely somewhat lower. The M1's p50 of 125 ns is three ticks, so the M1's median gap is real, but it is still only resolved to ±1 tick. `plot_latency.py` bins on the detected tick to avoid aliasing artifacts.
+- **The tail shoulder is the OS, not the engine.** The CCDF has a small plateau between roughly 1 and 4 µs, at a frequency of about 10⁻⁵ to 10⁻⁴ depending on the run. The hot path does no allocation and no locking, so this is consistent with scheduler preemption, interrupts, or first-touch page faults landing inside a sample. QoS elevation reduces how often this happens but cannot eliminate it on macOS.
 
 Regenerate the figure yourself:
 
