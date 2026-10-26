@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """Plot the per-message latency distribution produced by the replay harness.
 
-Reads the CSV written by `chronos_replay` (columns: sequence, latency_ns) and
-renders a two-panel figure:
-  * left:  histogram (log count) with p50 / p90 / p99 markers
+Reads the CSV written by `chronos_replay` (columns: sequence, latency_ns),
+drops the first 10% of messages as warmup, and renders a two-panel figure:
+  * left:  histogram (log count) with p50 / p90 / p95 / p99 / p99.9 markers
   * right: complementary CDF on log-log axes, the standard view for tail latency
+
+The warmup cut removes the period where the instruction cache, branch
+predictors, and data TLB are still cold and the price-level array is still
+growing, so the reported percentiles describe the steady-state hot path.
 
 Usage:
     ./build/src/chronos_replay latency.csv
     python3 scripts/plot_latency.py latency.csv -o docs/latency_histogram.png
+    python3 scripts/plot_latency.py latency.csv --warmup-fraction 0   # keep every sample
 """
 
 from __future__ import annotations
@@ -25,20 +30,42 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-PERCENTILES = (50.0, 90.0, 99.0, 99.9)
-MARKER_COLORS = {50.0: "#2a9d8f", 90.0: "#e9c46a", 99.0: "#e76f51"}
+PERCENTILES = (50.0, 90.0, 95.0, 99.0, 99.9)
+MARKER_COLORS = {
+    50.0: "#2a9d8f",
+    90.0: "#8ab17d",
+    95.0: "#e9c46a",
+    99.0: "#f4a261",
+    99.9: "#e76f51",
+}
 MAX_BINS = 400
 MIN_CLUSTER_SHARE = 0.005  # clusters below 0.5% of samples are treated as off-tick noise
+DEFAULT_WARMUP_FRACTION = 0.10
 
 
 def load_latencies(csv_path: Path) -> np.ndarray:
+    """Latency samples in arrival order (sorted by `sequence` when present)."""
     frame = pd.read_csv(csv_path)
     if "latency_ns" not in frame.columns:
         raise ValueError(f"{csv_path} has no 'latency_ns' column (found: {list(frame.columns)})")
+    if "sequence" in frame.columns:
+        frame = frame.sort_values("sequence", kind="stable")
     samples = frame["latency_ns"].to_numpy(dtype=np.float64)
     if samples.size == 0:
         raise ValueError(f"{csv_path} contains no samples")
     return samples
+
+
+def strip_warmup(samples: np.ndarray, fraction: float) -> tuple[np.ndarray, int]:
+    """Drops the first `fraction` of samples in arrival order.
+
+    Arrival order matters: warmup is a property of *when* a message ran, not
+    of how slow it was, so this must cut by position, never by value.
+    """
+    dropped = int(samples.size * fraction)
+    if dropped >= samples.size:
+        raise ValueError(f"warmup fraction {fraction} leaves no samples")
+    return samples[dropped:], dropped
 
 
 def timer_quantum(samples: np.ndarray) -> float:
@@ -90,7 +117,14 @@ def summarize(samples: np.ndarray) -> dict[str, float]:
     return stats
 
 
-def plot(samples: np.ndarray, stats: dict[str, float], quantum: float, clip_pct: float, out_path: Path) -> None:
+def plot(
+    samples: np.ndarray,
+    stats: dict[str, float],
+    quantum: float,
+    clip_pct: float,
+    warmup_dropped: int,
+    out_path: Path,
+) -> None:
     clip_value = float(np.percentile(samples, clip_pct))
     visible = samples[samples <= clip_value]
 
@@ -131,8 +165,9 @@ def plot(samples: np.ndarray, stats: dict[str, float], quantum: float, clip_pct:
         ax_ccdf.axvline(stats[f"p{pct:g}"], color=color, linestyle="--", linewidth=1.2)
     ax_ccdf.grid(which="both", alpha=0.25)
 
+    warmup_note = f" (first {warmup_dropped:,} dropped as warmup)" if warmup_dropped else ""
     fig.suptitle(
-        f"Chronos-ML replay: {int(stats['count']):,} messages | "
+        f"Chronos-ML replay: {int(stats['count']):,} messages{warmup_note} | "
         f"mean {stats['mean']:.1f} ns | max {stats['max']:.0f} ns | timer quantum {quantum:.2f} ns",
         fontsize=11,
     )
@@ -147,9 +182,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("csv", type=Path, nargs="?", default=Path("latency.csv"), help="replay harness CSV output")
     parser.add_argument("-o", "--output", type=Path, default=Path("latency_histogram.png"), help="output image path")
     parser.add_argument(
+        "--warmup-fraction",
+        type=float,
+        default=DEFAULT_WARMUP_FRACTION,
+        help="leading fraction of messages (in arrival order) to exclude as warmup (default: 0.10)",
+    )
+    parser.add_argument(
         "--clip-percentile",
         type=float,
-        default=99.9,
+        default=99.95,
         help="histogram x-axis cutoff, so rare multi-microsecond outliers don't flatten the body (CCDF is unclipped)",
     )
     parser.add_argument(
@@ -160,16 +201,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    if not 0.0 <= args.warmup_fraction < 1.0:
+        print(f"error: --warmup-fraction must be in [0, 1), got {args.warmup_fraction}", file=sys.stderr)
+        return 2
+
     try:
-        samples = load_latencies(args.csv)
+        samples, dropped = strip_warmup(load_latencies(args.csv), args.warmup_fraction)
     except (OSError, ValueError) as err:
         print(f"error: {err}", file=sys.stderr)
         return 1
 
     stats = summarize(samples)
     quantum = args.quantum_ns if args.quantum_ns is not None else timer_quantum(samples)
-    plot(samples, stats, quantum, args.clip_percentile, args.output)
+    plot(samples, stats, quantum, args.clip_percentile, dropped, args.output)
 
+    print(f"warmup    {dropped:,} dropped ({args.warmup_fraction:.0%})")
     print(f"samples   {int(stats['count']):,}")
     print(f"quantum   {quantum:.2f} ns")
     for pct in PERCENTILES:

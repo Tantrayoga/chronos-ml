@@ -10,6 +10,8 @@ On an Apple M4 Pro, the replay harness streams **1,000,000 binary wire messages*
 
 ![Latency distribution for a 1M-message replay](docs/latency_histogram.png)
 
+*M4 Pro, median-throughput run, first 10% of messages excluded as warmup, with p50 / p90 / p95 / p99 / p99.9 marked.*
+
 ---
 
 ## Contents
@@ -110,7 +112,7 @@ The weights are hand-set placeholders, not a trained model; see [Limitations](#l
 
 **Build:** commit `fc4596a`, Release (`-O3 -march=native`), compiled natively on each machine.
 
-**Method:** 5 unpaced runs of the replay per machine. Throughput is the median of the 5; percentiles come from run 3's full latency file via `plot_latency.py` (run 3 was within 1% of the median throughput on both machines). Both machines were plugged in, running from an editor terminal with everyday apps open, so these are typical-desktop numbers, not an isolated lab setup.
+**Method:** 5 unpaced runs of the replay per machine. Throughput is the median of the 5; percentiles come from run 3's full latency file via `plot_latency.py` (run 3 was within 1% of the median throughput on both machines). The comparison table uses every message; the script's default 10% warmup cut leaves the M4 Pro's p50 / p90 / p99 / p99.9 unchanged, because the cold-start effect is confined to roughly the first 1,000 messages (the M1 raw file was not rerun through the cut). Both machines were plugged in, running from an editor terminal with everyday apps open, so these are typical-desktop numbers, not an isolated lab setup.
 
 ### End-to-end market replay — [`src/replay_harness.cpp`](src/replay_harness.cpp)
 
@@ -162,7 +164,8 @@ Regenerate the figure yourself:
 ```sh
 ./build/src/chronos_replay latency.csv
 python3 -m pip install -r scripts/requirements.txt
-python3 scripts/plot_latency.py latency.csv -o docs/latency_histogram.png
+python3 scripts/plot_latency.py latency.csv -o docs/latency_histogram.png                       # drops first 10% as warmup
+python3 scripts/plot_latency.py latency.csv --warmup-fraction 0 -o /tmp/latency_all.png        # keep every message
 ```
 
 ---
