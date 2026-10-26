@@ -23,11 +23,13 @@ uint64_t now_ns() noexcept {
     const __uint128_t ticks_ns = static_cast<__uint128_t>(ticks) * 1'000'000'000ULL;
     return static_cast<uint64_t>(ticks_ns / freq_hz);
 #else
-    // Portable fallback for non-ARM64 targets; still monotonic, just paying
-    // for whatever indirection the platform's high_resolution_clock has.
+    // Portable fallback for non-ARM64 targets. steady_clock, not
+    // high_resolution_clock: libstdc++ aliases the latter to system_clock,
+    // which NTP can step backwards mid-sample. On Linux this is
+    // clock_gettime(CLOCK_MONOTONIC) via the vDSO, so no syscall either.
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::high_resolution_clock::now().time_since_epoch())
+            std::chrono::steady_clock::now().time_since_epoch())
             .count());
 #endif
 }

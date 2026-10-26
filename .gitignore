@@ -5,3 +5,5 @@ compile_commands.json
 __pycache__/
 latency.csv
 *.mov
+build-vscode/
+.vscode/
