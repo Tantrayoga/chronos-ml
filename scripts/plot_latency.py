@@ -12,7 +12,7 @@ growing, so the reported percentiles describe the steady-state hot path.
 
 Usage:
     ./build/src/chronos_replay latency.csv
-    python3 scripts/plot_latency.py latency.csv -o docs/latency_histogram.png
+    python3 scripts/plot_latency.py latency.csv -o images/m4_latency_histogram.png
     python3 scripts/plot_latency.py latency.csv --warmup-fraction 0   # keep every sample
 """
 

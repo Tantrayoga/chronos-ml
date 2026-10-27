@@ -1,231 +1,184 @@
-# Chronos-ML
+# Chronos-ML: Low-Latency High-Frequency Trading Engine (C++20)
 
-A zero-allocation, low-latency limit order book (LOB) matching engine in C++20, with an inline order-book-imbalance signal, built and measured on Apple Silicon.
+![Live Market Replay (Apple M1)](./images/m1_terminal_replay.gif)
 
-On an Apple M4 Pro, the replay harness streams **1,000,000 binary wire messages** from an ingress thread through a lock-free queue into the matching engine at **~15.2M messages/s**, with a per-message latency (decode + match + book update) of **p50 ≈ 42 ns, p99 ≈ 209 ns, p99.9 ≈ 375 ns**. The same engine runs at ~7.1M messages/s on a 2020 M1 and ~6.6M messages/s on a shared UofT AMD EPYC Linux server ([comparison](#cross-hardware-comparison)).
-
-![Terminal dashboard during a 1M-message replay](docs/replay_demo.gif)
-
-*Live dashboard from `chronos_replay --pace 400`. Pausing slows the replay so it can be watched; the paused time is not counted in throughput or latency.*
-
-![Latency distribution for a 1M-message replay](docs/latency_histogram.png)
-
-*M4 Pro, median-throughput run, first 10% of messages excluded as warmup, with p50 / p90 / p95 / p99 / p99.9 marked.*
+*Live market replay on an Apple M1: 1,000,000 binary orders streamed from an ingest thread through a lock-free SPSC ring buffer into the matching engine, with a branchless order-book-imbalance signal recomputed on every book update. The dashboard is slowed with `--pace 400` so it can be followed; paused time is excluded from the reported 6.84M orders/s.*
 
 ---
 
-## Contents
-
-- [System architecture](#system-architecture)
-- [Apple Silicon hardware tuning](#apple-silicon-hardware-tuning)
-- [Inline ML signal](#inline-ml-signal)
-- [Performance benchmarks](#performance-benchmarks)
-- [Building, testing, and running](#building-testing-and-running)
-- [Limitations and honest caveats](#limitations-and-honest-caveats)
-
----
-
-## System architecture
+## Architecture Overview
 
 ```
- raw bytes          SPSCQueue<Packet, 65536>          OrderBook<4096, 1M>
-┌──────────┐  push  ┌──────────────────────┐  front  ┌──────────────────────────┐
-│ ingress  │ ─────▶ │ head_ │ tail_ │ ring │ ──────▶ │ parse_wire_order (BE→LE) │
-│ thread   │        │ (own  │ (own  │      │         │ add_order → match()      │
-└──────────┘        │ line) │ line) │      │         │ on_book_state_changed()  │
-                    └──────────────────────┘         │   └▶ OBI (NEON) → signal │
-                                                     └──────────────────────────┘
+ raw bytes            SPSCQueue<Packet, 65536>            OrderBook<4096, 1M>
+┌──────────┐  push   ┌────────────────────────┐  front   ┌───────────────────────────┐
+│  ingest  │ ──────▶ │ head_ │ tail_ │  ring  │ ───────▶ │ parse_wire_order (BE→host)│
+│  thread  │         │ (own  │ (own  │        │          │ add_order → match()       │
+└──────────┘         │ line) │ line) │        │          │ on_book_state_changed()   │
+                     └────────────────────────┘          │   └▶ OBI (NEON) → signal  │
+                                                         └───────────────────────────┘
 ```
 
-### Zero-allocation object pool — [`memory_pool.h`](include/chronos/memory_pool.h)
+### Zero-allocation limit order book — [`order_book.h`](include/chronos/order_book.h)
 
-`FixedObjectPool<T, Capacity>` allocates a `std::array<T, Capacity>` once and hands out slots through an index-based free-list stack. `allocate()` and `deallocate()` are O(1) and never touch the heap after construction.
+All price levels live in one fixed `std::array`, sorted by `(side, price)`. Bids form a contiguous front block and asks a contiguous back block, so the best bid and best ask sit on either side of a single boundary index: finding a level is a binary search, and sweeping the book is a linear walk the hardware prefetcher handles well. There is no tree to rebalance and no pointer chasing. Each level also keeps a running `resting_qty`, so reading top-of-book depth never walks the order queues.
 
-### Cache-sized orders with intrusive queues — [`types.h`](include/chronos/types.h)
+Matching is price-time priority. An aggressive order crosses the spread level by level, fills resting orders oldest-first using a branch-free `std::min`, returns fully filled orders to the pool, and compacts emptied levels out of the array.
 
-`Order` is exactly 40 bytes with natural 8-byte alignment (enforced by `static_assert`), so no order ever straddles a cache line in the flat pool array. Orders link to each other by **32-bit pool index** rather than pointer: each price level's FIFO queue is threaded through `prev_idx`/`next_idx` directly inside the pool, so the order *is* the list node and no separate node allocation exists.
+### FixedObjectPool — [`memory_pool.h`](include/chronos/memory_pool.h)
 
-### Flat, sorted price-level array — [`order_book.h`](include/chronos/order_book.h)
+Every `Order` lives in a `FixedObjectPool<Order, N>`: one array allocated at startup, with an index-based free list. `allocate()` and `deallocate()` are O(1) and never call `malloc` or `free` after construction. Each `Order` is exactly 40 bytes with 8-byte alignment (checked by `static_assert`), so no order straddles a cache line. Orders link into their price level's FIFO queue through 32-bit pool indices stored inside the order itself (an intrusive list), so queueing an order allocates nothing.
 
-All levels live in one `std::array<PriceLevel, MaxPriceLevels>` sorted by `(side, price)`. Buy levels form a contiguous front block and Sell levels a contiguous back block, so the best bid and best ask sit on either side of a single boundary index. Sweeping the book is a linear walk outward from that boundary, which the hardware prefetcher handles well, with no tree rebalancing and no pointer chasing.
+### Lock-free SPSC ring buffer — [`spsc_queue.h`](include/chronos/spsc_queue.h)
 
-Each `PriceLevel` keeps an incrementally maintained `resting_qty`, updated on every append, fill, and cancel, so reading top-N depth for the ML features is O(N) instead of a walk over every resting order.
+The ingest and matching threads communicate only through `SPSCQueue<T, Capacity>`:
 
-### Matching engine
-
-`add_order()` → `match()` implements price-time priority: an aggressive order crosses the spread against the best opposite levels, fills FIFO within each level using `std::min(taker_remaining, resting_remaining)` (lowered to a conditional select, not a branch), unlinks fully filled orders back to the pool, and compacts drained levels out of the array. `cancel_order()` uses the same unlink and compaction path.
-
-### Lock-free SPSC queue — [`spsc_queue.h`](include/chronos/spsc_queue.h)
-
-`SPSCQueue<T, Capacity>` decouples ingress from matching:
-
-- **False-sharing isolation:** `head_`, `tail_`, and the storage ring each get their own `alignas(128)` cache line. 128 bytes is the line size both the M4 Pro and M1 report (`hw.cachelinesize`), not the 64 bytes common on x86.
-- **Minimal ordering:** each side loads its own index `relaxed`, loads the other side's index `acquire`, and publishes with `release`. There is no `seq_cst` anywhere on the path.
-- **Power-of-two masking:** wraparound is `index & (Capacity - 1)`, not `%`.
+- **No false sharing:** `head_`, `tail_`, and the storage ring each sit on their own cache line (`alignas(128)` on Apple Silicon, 64 bytes elsewhere), so the producer's writes never invalidate the consumer's line and vice versa.
+- **Minimal memory ordering:** each side reads its own index `relaxed`, reads the other side's index with `acquire`, and publishes with `release`. There is no `seq_cst` anywhere on the path.
+- **No division:** capacity is a power of two, so wraparound is `index & (Capacity - 1)` rather than `%`.
 - **Zero-copy consume:** `front()` / `pop_front()` let the matcher decode a packet in place inside the ring slot.
 
-Verified by a two-thread stress test that moves 1,000,000 sequenced items with zero loss and zero reordering.
+A two-thread stress test moves 1,000,000 sequenced items with no loss and no reordering.
 
-### Zero-copy binary protocol — [`binary_parser.h`](include/chronos/binary_parser.h)
+### Zero-copy binary ingestion — [`binary_parser.h`](include/chronos/binary_parser.h)
 
-`WireOrder` messages use a fixed 22-byte, big-endian layout (ITCH/OUCH style). `parse_wire_order()` extracts each field with fixed-size `std::memcpy`, which avoids both misaligned loads and strict-aliasing UB and compiles to the same load instructions a pointer cast would produce. Byte order is converted with `__builtin_bswap64/32` (a single `REV` instruction on ARM64). `encode_wire_order()` is the exact inverse; a round-trip test pins the format.
+Orders arrive as fixed 22-byte, big-endian wire messages in the style of ITCH/OUCH. Fields are read with fixed-size `std::memcpy` (no misaligned loads, no strict-aliasing undefined behavior; the compiler emits plain loads) and byte-swapped with `__builtin_bswap`, a single `REV` instruction on ARM64.
 
-### Telemetry — [`telemetry.h`](include/chronos/telemetry.h)
+### ARM NEON SIMD and branchless inference — [`ml_simd.h`](include/chronos/ml_simd.h), [`ml_inference.h`](include/chronos/ml_inference.h)
 
-`now_ns()` reads the ARM64 virtual counter (`CNTVCT_EL0`) directly with `mrs`, with no syscall. `LatencyRingBuffer` is a fixed-capacity, single-writer event log recording the T1–T4 lifecycle checkpoints (received → crossed → unlinked → signal emitted) through an optional, null-by-default sink on the book.
-
----
-
-## Apple Silicon hardware tuning
-
-### Thread QoS and naming — [`thread_utils.h`](include/chronos/thread_utils.h)
-
-macOS has no `sched_setaffinity`, `taskset`, or `isolcpus`. The XNU scheduler keeps thread placement for itself so it can balance P-cores, E-cores, and thermals, and exposes *intent* to applications instead of hard pinning.
-
-| Utility | Mechanism | Result on M4 Pro (macOS 15.5) and M1 (macOS 14.6.1) |
-|---|---|---|
-| `elevate_thread_qos()` | `pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE)` | **Accepted.** The strongest scheduling-priority signal available to user code. |
-| `set_thread_name()` | `pthread_setname_np` (calling thread only on macOS) | **Accepted.** Threads appear as `chronos-ingress` / `chronos-matcher` in Instruments and lldb. |
-| `set_thread_affinity_tag()` | Mach `thread_policy_set(THREAD_AFFINITY_POLICY)` | **Rejected with `KERN_NOT_SUPPORTED`.** Apple Silicon does not implement affinity tags; the call is kept for Intel Macs and degrades to a no-op. |
-
-So on Apple Silicon, QoS class is the only real placement lever. The engine does not rely on the affinity tag for correctness or for its benchmark numbers.
-
-### ARM NEON SIMD — [`ml_simd.h`](include/chronos/ml_simd.h)
-
-The order book imbalance (OBI) feature is computed with NEON intrinsics. Four price levels of bid and ask volume load into `uint32x4_t` registers (`vld1q_u32`), convert to `float32x4_t` in one instruction (`vcvtq_f32_u32`), and produce four lanes of `bid − ask` and `bid + ask` with one `vsubq_f32` and one `vaddq_f32`. A single horizontal reduction (`vaddvq_f32` → `faddp`) per call collapses the lanes, and the fifth level is handled by a scalar tail. The compiled object contains `ucvtf.4s`, `fsub.4s`, `fadd.4s`, and `faddp` as expected. A 10,000-trial randomized test checks the result against a scalar reference.
+- **Feature (NEON):** order book imbalance, `OBI = (Σbid − Σask) / (Σbid + Σask)` over the top 5 levels. Four levels of bid and ask volume load into `float32x4_t` registers, and one `vsubq_f32` plus one `vaddq_f32` handle four levels at once, followed by a single horizontal reduction. A 10,000-trial test checks it against a scalar reference, and non-ARM builds fall back to scalar code automatically.
+- **Model (branchless):** a fixed, compile-time linear model over `{OBI, spread}`, thresholded into `{Down, Flat, Up}` as `(score > up) − (score < down)`. That compiles to compare-and-set instructions, so there is no conditional branch for the predictor to miss.
+- **Integration:** every insert, fill, and cancel recomputes the features and runs inference in constant time. The weights are hand-set to demonstrate hot-path integration; they are not trained on market data.
 
 ---
 
-## Inline ML signal
+## Performance Benchmarks
 
-[`ml_inference.h`](include/chronos/ml_inference.h)
+![M4 Pro Latency Histogram](./images/m4_latency_histogram.png)
 
-- **Feature:** `OBI = (Σbid − Σask) / (Σbid + Σask)` over the top 5 levels per side, bounded in `[−1, 1]`.
-- **Model:** a fixed `constexpr` linear model over `{OBI, spread}`, thresholded into `{Down, Flat, Up}` with arithmetic (`(score > up) − (score < down)`) that lowers to `cset`, not a conditional branch.
-- **Wiring:** every book mutation (insert, fill, cancel) calls `on_book_state_changed()`, which recomputes features and runs inference in constant time. With no telemetry sink attached, the hook costs a single null check.
+*Apple M4 Pro, 1M-message replay, first 10% excluded as warmup. Left: latency histogram (log scale) with p50 / p90 / p95 / p99 / p99.9 marked. Right: complementary CDF, showing the rare slow events far out in the tail.*
 
-The weights are hand-set placeholders, not a trained model; see [Limitations](#limitations-and-honest-caveats).
+**Baseline (M4 Pro).** The engine processes **~15.2M orders/s** with **p50 ≈ 42 ns, p99 ≈ 209 ns, p99.9 ≈ 375 ns**. The most likely reasons are the M4 Pro's fast cores and its large caches (16 MB of L2 per core cluster), which keep the hottest data, the price-level array and the queue slots in use, close to the CPU. The 42 ns median is also the measurement floor: Apple Silicon's 24 MHz counter ticks every ~41.7 ns, so the true median is likely a little lower.
 
----
+The spikes start just **past** p99.9. About 1 in 100,000 orders takes 1–10 µs, shown as the flat shelf on the right of the chart. The engine never allocates, locks, or blocks, so these stalls come from macOS pausing the thread (preemption, interrupts, page faults). macOS offers no core isolation: the strongest available lever is the `QOS_CLASS_USER_INTERACTIVE` priority hint, and Apple Silicon rejects Mach thread-affinity requests outright (`KERN_NOT_SUPPORTED`).
 
-## Performance benchmarks
+**Method.** Release builds (`-O3 -march=native`) compiled natively on each machine; 5 unpaced runs per configuration, median throughput, with percentiles from a representative run. Latency covers decoding plus matching one order. It does not include time spent waiting in the queue. The Macs ran with everyday apps open, so these are typical-desktop numbers, not lab conditions.
 
-The same engine, measured on three environments: two Apple Silicon laptops and a shared UofT CS Linux server.
+### Cross-hardware comparison (no pinning)
 
-**Build:** Release (`-O3 -march=native`), compiled natively on each machine. Macs at commit `fc4596a`; Linux at `499663e`, which adds only the Linux build fix (the hot path is identical).
-
-**Method:** 5 unpaced runs of the replay per configuration. Throughput is the median of the 5; percentiles come from run 3's latency file (run 3 was within 3% of the median throughput in every configuration). The Mac tables use every message; the Linux tables drop the first 10% as warmup, which on the M4 Pro left p50 / p90 / p99 / p99.9 unchanged (the cold-start effect lasts only about the first 1,000 messages). The Macs were plugged in, running from an editor terminal with everyday apps open, so these are typical-desktop numbers, not an isolated lab setup.
-
-### End-to-end market replay — [`src/replay_harness.cpp`](src/replay_harness.cpp)
-
-1,000,000 pre-generated, deterministic ITCH-style messages (about 30% aggressive), streamed ingress thread → `SPSCQueue` → matching thread. Latency is measured per message around **decode + `add_order` (match, book update, inference hook)**. It does **not** include the time a message waits in the queue before the matcher picks it up, and dashboard rendering is excluded.
-
-### Cross-hardware comparison
-
-All three run with the OS free to place threads wherever it likes (no pinning).
-
-| Metric | M4 Pro (macOS) | M1 (macOS) | AMD EPYC 74F3 (Linux) |
+| Metric | Apple M4 Pro (macOS 15.5) | Apple M1 (macOS 14.6.1) | AMD EPYC 74F3 (Ubuntu 24.04, shared) |
 |---|---|---|---|
-| Throughput | **15.2M msg/s** | **7.1M msg/s** | **6.6M msg/s** |
+| Throughput | **15.2M orders/s** | **7.1M orders/s** | **6.6M orders/s** |
 | p50 | 42 ns | 125 ns | 70 ns |
 | p90 | 84 ns | 167 ns | 170 ns |
 | p99 | 209 ns | 500 ns | 290 ns |
 | p99.9 | 375 ns | 875 ns | 460 ns |
-| mean | 59 ns | 132 ns | 85 ns |
-| max (single worst message) | ~10 µs | ~30 µs | ~28 µs |
-| Rejected orders | 0 | 0 | 0 |
-| Throughput spread across 5 runs | 12.2–15.3M (first run slower, the rest within 1.3%) | 7.00–7.11M | 5.43–6.74M (first run slower, the rest within 3%) |
-
-| Machine | M4 Pro | M1 | UofT `wolf.teach.cs` |
-|---|---|---|---|
-| CPU | Apple M4 Pro | Apple M1 | AMD EPYC 74F3 (Zen 3), 2 sockets |
-| Cores | 8P + 4E | 4P + 4E | 48 (24 per socket, SMT off) |
-| L2 | 16 MB per P-cluster | 12 MB per P-cluster | 512 KB per core |
-| L3 | n/a | n/a | 32 MB per chiplet (512 MB total) |
-| Cache line (queue padding) | 128 B | 128 B | 64 B |
-| Timer used by the engine | 24 MHz counter (~41.7 ns ticks) | 24 MHz counter (~41.7 ns ticks) | `steady_clock` (readings in 10 ns steps) |
-| OS | macOS 15.5 | macOS 14.6.1 | Ubuntu 24.04, kernel 6.8 |
+| Worst single order | ~10 µs | ~30 µs | ~28 µs |
 | Compiler | Apple clang 17 | Apple clang 15 | GCC 13.3 |
-| Other load during the run | everyday apps | everyday apps | shared server: 41 sessions, load average ~5 |
 
-- **M4 Pro vs M1:** the same code runs about 2.1–2.4× faster on the M4 Pro across throughput and the tail. The M1 is also two macOS releases and two Apple clang versions behind, so part of the gap may be the compiler, not the silicon.
-- **Linux server vs the Macs:** the EPYC sits between the two laptops. Its p50, p99 and p99.9 are closer to the M4 Pro's, while its p90 and throughput are closer to the M1's. This is a 2021 server part tuned for many parallel cores rather than single-thread speed, it was serving 41 other sessions at the time, and the queue handoff crosses between cores on a two-socket machine.
-- **The p50s are not exactly comparable.** The Macs read a 24 MHz hardware counter, so anything under ~42 ns reads as 0 or 42. The Linux build reads `steady_clock`, which has finer steps but costs more to read, and that read cost is part of every Linux sample.
+The M4 Pro runs the same code 2.1–2.4× faster than the M1 (part of that gap is the M1's older compiler). The EPYC server, a 2021 part built for many parallel cores, was shared with 41 other sessions during the run and lands between the two laptops. The Linux build uses `steady_clock` (10 ns steps) instead of Apple's 24 MHz counter, so the p50s aren't exactly comparable.
 
-![Terminal dashboard on the M1](docs/replay_demo_m1.gif)
+### Thread pinning on the Linux server
 
-*The same paced replay on the M1 (`--pace 400`). The book state at each checkpoint is identical to the M4 Pro run, because the feed is deterministic; only the timing differs.*
+| Placement | Throughput | p50 | p99 | p99.9 | Worst single order |
+|---|---|---|---|---|---|
+| Unpinned | 6.6M orders/s | 70 ns | 290 ns | 460 ns | 28 µs |
+| `taskset -c 1` (both threads on one core) | 10.2M orders/s | 60 ns | 230 ns | 390 ns | **133 µs** |
+| `taskset -c 2,3` (one core per thread) | 6.8M orders/s | 70 ns | 300 ns | 460 ns | **186 µs** |
 
-### Thread pinning on Linux
-
-Linux, unlike macOS, lets a user pin a process to specific cores with `taskset`. Same machine, same binary, three placements:
-
-| Placement on `wolf` | Throughput | p50 | p90 | p95 | p99 | p99.9 | max | Throughput spread |
-|---|---|---|---|---|---|---|---|---|
-| A. unpinned | 6.6M msg/s | 70 ns | 170 ns | 200 ns | 290 ns | 460 ns | 28 µs | 5.43–6.74M |
-| B. `taskset -c 1` (both threads share one core) | **10.2M msg/s** | **60 ns** | **90 ns** | 150 ns | **230 ns** | **390 ns** | 133 µs | **9.97–10.20M** |
-| C. `taskset -c 2,3` (one core per thread) | 6.8M msg/s | 70 ns | 170 ns | 200 ns | 300 ns | 460 ns | 186 µs | 6.52–7.13M |
-
-- **One shared core was the fastest and most repeatable**, with 1.5× the throughput, a lower tail, and only 2% run-to-run variation. With both threads on one core, each message the ingress thread writes is still in that core's own cache when the matcher reads it. On two cores (A and C), every message's cache line has to move between cores first, and that transfer costs more than the two threads taking turns.
-- **That number flatters B.** The benchmark times only how long each message takes to process, not how long it waited in the queue. On a shared core, the matcher can't run while the ingress thread holds the CPU, so messages pile up in the queue. For a live feed, that waiting time is exactly the latency that matters, and this harness doesn't measure it. B's 133 µs worst case is the visible sign: most likely the matcher being paused partway through a message.
-- **Pinning to separate cores (C) changed nothing compared with unpinned (A).** `taskset` only restricts where *this* process may run; it doesn't keep other users' work, kernel threads, or interrupts off cores 2 and 3. A truly quiet core needs `isolcpus` / `nohz_full` and moving interrupts elsewhere, all of which need root and weren't available on a shared lab server. So these runs show what pinning does on a busy machine, not what full core isolation would do.
-
-### Component benchmarks — [`tests/test_benchmark.cpp`](tests/test_benchmark.cpp)
-
-| Scenario | M4 Pro | M1 | EPYC 74F3 (Linux) |
-|---|---|---|---|
-| Resting insert, 10,000 orders across 500 levels | p50 ≈ 42 ns, p99 ≈ 84 ns | p50 ≈ 125 ns, p99 ≈ 167 ns | p50 ≈ 60 ns, p99 ≈ 80 ns |
-| Single taker sweeping ~250 levels / 5,000 resting orders (50,000 units) | ≈ 39–40 µs (≈ 8 ns per resting order consumed) | ≈ 99 µs (≈ 20 ns per resting order consumed) | ≈ 65 µs (≈ 13 ns per resting order consumed) |
-
-### Reading the distribution
-
-- **Timer resolution sets the floor.** Both chips' counters run at 24 MHz (`hw.tbfrequency`), so one tick is about 41.67 ns and every sample is a whole number of ticks. The M4 Pro's p50 of 42 ns means "within one tick", and about 5% of its samples read 0 ns (they finished inside a single tick), so its true median is likely somewhat lower. The M1's p50 of 125 ns is three ticks, so the M1's median gap is real, but it is still only resolved to ±1 tick. On Linux the engine reads `steady_clock` instead, whose readings came in 10 ns steps. `plot_latency.py` bins on the detected step to avoid aliasing artifacts.
-- **The rare slow outliers come from the OS, not the engine.** The Mac CCDF has a small plateau between roughly 1 and 4 µs, at a frequency of about 10⁻⁵ to 10⁻⁴ depending on the run, and the Linux maxima reach 28–186 µs. The hot path does no allocation and no locking, so these are consistent with scheduler preemption, interrupts, or first-touch page faults landing inside a sample. QoS elevation on macOS and `taskset` on Linux change how often this happens, but neither can eliminate it without full core isolation.
-
-Regenerate the figure yourself:
-
-```sh
-./build/src/chronos_replay latency.csv
-python3 -m pip install -r scripts/requirements.txt
-python3 scripts/plot_latency.py latency.csv -o docs/latency_histogram.png                       # drops first 10% as warmup
-python3 scripts/plot_latency.py latency.csv --warmup-fraction 0 -o /tmp/latency_all.png        # keep every message
-```
+Pinning did not produce a flat tail. The next section explains why.
 
 ---
 
-## Building, testing, and running
+## Systems Diagnostic: Hardware & OS Jitter
 
-Requires CMake ≥ 3.25 and a C++20 compiler. Catch2 and Google Benchmark are fetched automatically. Tested on macOS (Apple clang 15 and 17, arm64) and Ubuntu 24.04 (GCC 13.3, x86-64). On Linux the NEON path falls back to scalar code and the macOS QoS/affinity calls are no-ops; pin with `taskset` instead.
+**Setup.** The engine was rebuilt on a shared UofT CS Linux node (`wolf.teach.cs`: 2× AMD EPYC 74F3, 48 cores, 41 active sessions, load average ~5) and run unpinned, pinned with `taskset -c 1`, and pinned with `taskset -c 2,3`.
+
+**Expectation.** Pinning with `taskset` would remove scheduler noise and flatten the tail.
+
+**Result.** It did not. Both pinned configurations kept multi-microsecond outliers, and their worst cases (133 µs and 186 µs) were *worse* than the unpinned run's 28 µs. Four independent causes explain this.
+
+### a) OS scheduling: `taskset` fences the program in, it doesn't fence others out
+
+`taskset -c 1` restricts *this* process to core 1. It does not reserve core 1. The kernel still runs other users' processes, its own housekeeping threads, hardware interrupts (network, disk, timers), and the scheduler's periodic tick on that core. Each of those preempts whichever order is being matched at that moment, and that wait lands inside the latency sample. On a node shared with 41 sessions, this is the dominant source of the outliers.
+
+### b) CPU clock scaling
+
+`lscpu` reported the cores running at about 48% of their maximum frequency. Without the `performance` governor, which requires root, the clock rises and falls with load and power management, so the same code path takes a different amount of time from one moment to the next. That variation spreads the whole distribution, not just the tail.
+
+### c) Dual-thread interference on a shared core
+
+Pinning the ingest (producer) thread and the matching (consumer) thread to the same core forces the OS to time-slice between them. The measurements show this cuts both ways:
+
+- **What it helps:** throughput rose 1.5× and p99 fell. Each packet the producer writes is still in that core's L1/L2 cache when the consumer reads it, so the cross-core cache-line transfers the SPSC queue normally pays for disappear.
+- **What it costs:** the matcher can be switched out *partway through* an order, so that order's measured latency includes the other thread's entire time slice. That is the 133 µs worst case. Separately, while the producer holds the core, arriving orders wait in the queue. The benchmark doesn't time that queueing delay, but on a live feed it is real latency, which is why this configuration's better numbers would not carry over to production.
+
+### d) Algorithmic variance
+
+Not every order does the same work:
+
+- **Resting order at an existing price:** a binary search plus an append to the level's queue, the ~40–70 ns common case.
+- **Resting order at a new price:** also inserts a level into the sorted array, shifting the entries after it.
+- **Aggressive order:** loops over resting orders, and sometimes across several price levels, until it is filled.
+
+This gives a natural spread of roughly **40 ns to 300 ns (p50 to p99)** that has nothing to do with the OS. Even a perfectly isolated core would show this spread. Isolation can only remove the rare, large OS-induced spikes on top of it.
+
+---
+
+## Requirements for True Determinism
+
+A flat, deterministic tail requires owning the hardware. On a dedicated Linux trading host, the standard configuration is:
+
+| Parameter | Level | Effect |
+|---|---|---|
+| `isolcpus=<cores>` | Kernel boot parameter | Removes the cores from the normal scheduler, so no other task is placed on them |
+| `nohz_full=<cores>` | Kernel boot parameter | Stops the scheduler's periodic tick on those cores while a single task runs |
+| `irqaffinity=<other cores>` | Kernel boot parameter (plus per-IRQ `smp_affinity`) | Routes hardware interrupts to non-isolated cores |
+| `rcu_nocbs=<cores>` | Kernel boot parameter | Moves kernel RCU callback processing off the isolated cores |
+| `performance` CPU governor | Runtime (root) | Locks the clock at a fixed frequency, so execution time stops drifting |
+| `SCHED_FIFO` | Thread scheduling policy (root or `CAP_SYS_NICE`) | Gives the engine threads real-time priority, so normal tasks cannot preempt them |
+| One thread per isolated core | Application design | The producer and consumer never time-slice against each other, so no order is paused mid-match |
+
+Every row except the last needs root access or kernel boot changes, which a shared university node does not allow. None of these settings were measured here; the Linux results above reflect a busy shared machine, not a tuned trading host.
+
+---
+
+## Build & Run
+
+**Requirements:** CMake ≥ 3.25 and a C++20 compiler. Catch2 and Google Benchmark are downloaded automatically on the first configure. Tested on macOS (Apple clang 15 and 17, arm64) and Ubuntu 24.04 (GCC 13.3, x86-64).
 
 ```sh
+git clone https://github.com/Tantrayoga/chronos-ml.git && cd chronos-ml
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-
-./build/tests/chronos_tests        # 39 test cases, ~30k assertions
-./build/src/chronos_replay         # 1M-message replay + live terminal dashboard
-./build/src/chronos_replay --pace 400   # same, paused 400 ms per frame so it can be watched
 ```
 
-| Test file | Covers |
-|---|---|
-| `test_types.cpp`, `test_memory_pool.cpp` | `Order` layout, pool allocate/free semantics |
-| `test_order_book.cpp` | FIFO links, level sorting, crossing, partial fills, multi-level sweeps |
-| `test_integration.cpp` | T1–T4 telemetry ordering, cancel compaction, null-sink behavior |
-| `test_spsc_queue.cpp` | FIFO, wraparound, full/empty, 1M-item two-thread stress |
-| `test_threading.cpp` | QoS / naming / affinity applied around a live SPSC pipeline |
-| `test_binary_parser.cpp` | Endianness swap, truncation, round-trip encode/parse, routing into the book |
-| `test_ml_inference.cpp`, `test_ml_simd.cpp` | OBI bounds, prediction thresholds, NEON vs. scalar equivalence |
-| `test_benchmark.cpp` | 10k-order insertion percentiles, deep sweep timing |
+**Run the tests** (39 test cases, including a 1M-item two-thread queue stress test):
 
----
+```sh
+./build/tests/chronos_tests
+```
 
-## Limitations and honest caveats
+**Run the market replay** (1M orders, live terminal dashboard, per-order latency written to CSV):
 
-- **Single instrument, limit orders only.** No IOC/FOK/stop/iceberg order types, no multi-symbol routing, no risk or position checks before matching.
-- **No network or persistence layer.** The replay generates bytes in memory; there is no socket I/O, no journaling, and no crash recovery.
-- **Cancels from the wire are parsed but not routed.** Resolving a `CancelOrder` message requires an order-id → pool-index map, which is not implemented yet.
-- **The model is a placeholder.** The linear weights are hand-set to demonstrate branchless, constant-time inference on the hot path. They are not fit to market data and carry no predictive claim.
-- **"Zero allocation" is by construction, not yet by enforcement.** Every hot-path structure is a fixed-size array allocated before the replay starts, but the build does not yet trap stray allocations (for example, with a debug `operator new` override) or run under ThreadSanitizer.
-- **Thread affinity is unavailable on Apple Silicon** (see above). Mac results reflect QoS elevation only.
-- **Latency excludes queueing delay.** Each sample covers processing one message, not the time it waited in the SPSC queue. This is why sharing one core looks best on Linux in this benchmark, even though it would delay messages on a live feed.
-- **No isolated-core measurement.** The Linux runs used a shared lab server without root, so `isolcpus` / `nohz_full` were not available. The pinning results reflect a busy machine, not a dedicated trading host.
+```sh
+./build/src/chronos_replay latency.csv               # full speed, for benchmarking
+./build/src/chronos_replay --pace 400 latency.csv   # slowed down so the dashboard can be watched
+```
+
+Paused time from `--pace` is excluded from the reported throughput and latency, but use unpaced runs for benchmark numbers.
+
+**Plot the latency distribution:**
+
+```sh
+python3 -m pip install -r scripts/requirements.txt
+python3 scripts/plot_latency.py latency.csv -o latency_histogram.png                       # drops first 10% as warmup
+python3 scripts/plot_latency.py latency.csv --warmup-fraction 0 -o latency_all.png         # keeps every order
+```
+
+**Pin to cores on Linux** (macOS has no equivalent):
+
+```sh
+taskset -c 2,3 ./build/src/chronos_replay latency.csv    # one core per thread
+```
+
+On Linux, the NEON code falls back to scalar code and the macOS thread-priority calls do nothing; use `taskset` for core placement instead.
