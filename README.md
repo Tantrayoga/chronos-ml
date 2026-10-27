@@ -2,7 +2,7 @@
 
 A zero-allocation, low-latency limit order book (LOB) matching engine in C++20, with an inline order-book-imbalance signal, built and measured on Apple Silicon.
 
-On an Apple M4 Pro, the replay harness streams **1,000,000 binary wire messages** from an ingress thread through a lock-free queue into the matching engine at **~15.2M messages/s**, with a per-message latency (decode + match + book update) of **p50 ≈ 42 ns, p99 ≈ 209 ns, p99.9 ≈ 375 ns**. The same commit on a 2020 M1 runs at ~7.1M messages/s ([comparison](#m4-pro-vs-m1)).
+On an Apple M4 Pro, the replay harness streams **1,000,000 binary wire messages** from an ingress thread through a lock-free queue into the matching engine at **~15.2M messages/s**, with a per-message latency (decode + match + book update) of **p50 ≈ 42 ns, p99 ≈ 209 ns, p99.9 ≈ 375 ns**. The same engine runs at ~7.1M messages/s on a 2020 M1 and ~6.6M messages/s on a shared UofT AMD EPYC Linux server ([comparison](#cross-hardware-comparison)).
 
 ![Terminal dashboard during a 1M-message replay](docs/replay_demo.gif)
 
@@ -110,54 +110,77 @@ The weights are hand-set placeholders, not a trained model; see [Limitations](#l
 
 ## Performance benchmarks
 
-**Build:** commit `fc4596a`, Release (`-O3 -march=native`), compiled natively on each machine.
+The same engine, measured on three environments: two Apple Silicon laptops and a shared UofT CS Linux server.
 
-**Method:** 5 unpaced runs of the replay per machine. Throughput is the median of the 5; percentiles come from run 3's full latency file via `plot_latency.py` (run 3 was within 1% of the median throughput on both machines). The comparison table uses every message; the script's default 10% warmup cut leaves the M4 Pro's p50 / p90 / p99 / p99.9 unchanged, because the cold-start effect is confined to roughly the first 1,000 messages (the M1 raw file was not rerun through the cut). Both machines were plugged in, running from an editor terminal with everyday apps open, so these are typical-desktop numbers, not an isolated lab setup.
+**Build:** Release (`-O3 -march=native`), compiled natively on each machine. Macs at commit `fc4596a`; Linux at `499663e`, which adds only the Linux build fix (the hot path is identical).
+
+**Method:** 5 unpaced runs of the replay per configuration. Throughput is the median of the 5; percentiles come from run 3's latency file (run 3 was within 3% of the median throughput in every configuration). The Mac tables use every message; the Linux tables drop the first 10% as warmup, which on the M4 Pro left p50 / p90 / p99 / p99.9 unchanged (the cold-start effect lasts only about the first 1,000 messages). The Macs were plugged in, running from an editor terminal with everyday apps open, so these are typical-desktop numbers, not an isolated lab setup.
 
 ### End-to-end market replay — [`src/replay_harness.cpp`](src/replay_harness.cpp)
 
-1,000,000 pre-generated, deterministic ITCH-style messages (about 30% aggressive), streamed ingress thread → `SPSCQueue` → matching thread. Latency is measured per message around **decode + `add_order` (match, book update, inference hook)**. Dashboard rendering is excluded from the timing window.
+1,000,000 pre-generated, deterministic ITCH-style messages (about 30% aggressive), streamed ingress thread → `SPSCQueue` → matching thread. Latency is measured per message around **decode + `add_order` (match, book update, inference hook)**. It does **not** include the time a message waits in the queue before the matcher picks it up, and dashboard rendering is excluded.
 
-### M4 Pro vs M1
+### Cross-hardware comparison
 
-| Metric | M4 Pro | M1 | M4 Pro advantage |
+All three run with the OS free to place threads wherever it likes (no pinning).
+
+| Metric | M4 Pro (macOS) | M1 (macOS) | AMD EPYC 74F3 (Linux) |
 |---|---|---|---|
-| Throughput | **15.2M msg/s** | **7.1M msg/s** | 2.1× |
-| p50 | 42 ns | 125 ns | ~3× (M4 Pro is at the timer floor) |
-| p90 | 84 ns | 167 ns | 2.0× |
-| p99 | 209 ns | 500 ns | 2.4× |
-| p99.9 | 375 ns | 875 ns | 2.3× |
-| mean | 59 ns | 132 ns | 2.2× |
-| max (single worst message) | ~10 µs | ~30 µs | n/a |
-| Rejected orders | 0 | 0 | |
-| Throughput spread across 5 runs | 12.2–15.3M (first run slower, the rest within 1.3%) | 7.00–7.11M | |
+| Throughput | **15.2M msg/s** | **7.1M msg/s** | **6.6M msg/s** |
+| p50 | 42 ns | 125 ns | 70 ns |
+| p90 | 84 ns | 167 ns | 170 ns |
+| p99 | 209 ns | 500 ns | 290 ns |
+| p99.9 | 375 ns | 875 ns | 460 ns |
+| mean | 59 ns | 132 ns | 85 ns |
+| max (single worst message) | ~10 µs | ~30 µs | ~28 µs |
+| Rejected orders | 0 | 0 | 0 |
+| Throughput spread across 5 runs | 12.2–15.3M (first run slower, the rest within 1.3%) | 7.00–7.11M | 5.43–6.74M (first run slower, the rest within 3%) |
 
-| Machine | M4 Pro | M1 |
-|---|---|---|
-| Cores | 8P + 4E | 4P + 4E |
-| L2 per P-cluster | 16 MB | 12 MB |
-| Cache line | 128 B | 128 B |
-| Timer | 24 MHz | 24 MHz |
-| macOS | 15.5 | 14.6.1 |
-| Compiler | Apple clang 17 | Apple clang 15 |
+| Machine | M4 Pro | M1 | UofT `wolf.teach.cs` |
+|---|---|---|---|
+| CPU | Apple M4 Pro | Apple M1 | AMD EPYC 74F3 (Zen 3), 2 sockets |
+| Cores | 8P + 4E | 4P + 4E | 48 (24 per socket, SMT off) |
+| L2 | 16 MB per P-cluster | 12 MB per P-cluster | 512 KB per core |
+| L3 | n/a | n/a | 32 MB per chiplet (512 MB total) |
+| Cache line (queue padding) | 128 B | 128 B | 64 B |
+| Timer used by the engine | 24 MHz counter (~41.7 ns ticks) | 24 MHz counter (~41.7 ns ticks) | `steady_clock` (readings in 10 ns steps) |
+| OS | macOS 15.5 | macOS 14.6.1 | Ubuntu 24.04, kernel 6.8 |
+| Compiler | Apple clang 17 | Apple clang 15 | GCC 13.3 |
+| Other load during the run | everyday apps | everyday apps | shared server: 41 sessions, load average ~5 |
 
-The same code, unchanged, runs about 2.1–2.4× faster on the M4 Pro across throughput and the tail. Both chips report 128-byte cache lines, so the queue's `alignas(128)` padding is correct on both. **The comparison is not purely silicon:** the M1 is also two macOS releases and two Apple clang major versions behind, and some of the gap may come from the compiler.
+- **M4 Pro vs M1:** the same code runs about 2.1–2.4× faster on the M4 Pro across throughput and the tail. The M1 is also two macOS releases and two Apple clang versions behind, so part of the gap may be the compiler, not the silicon.
+- **Linux server vs the Macs:** the EPYC sits between the two laptops. Its p50, p99 and p99.9 are closer to the M4 Pro's, while its p90 and throughput are closer to the M1's. This is a 2021 server part tuned for many parallel cores rather than single-thread speed, it was serving 41 other sessions at the time, and the queue handoff crosses between cores on a two-socket machine.
+- **The p50s are not exactly comparable.** The Macs read a 24 MHz hardware counter, so anything under ~42 ns reads as 0 or 42. The Linux build reads `steady_clock`, which has finer steps but costs more to read, and that read cost is part of every Linux sample.
 
 ![Terminal dashboard on the M1](docs/replay_demo_m1.gif)
 
 *The same paced replay on the M1 (`--pace 400`). The book state at each checkpoint is identical to the M4 Pro run, because the feed is deterministic; only the timing differs.*
 
+### Thread pinning on Linux
+
+Linux, unlike macOS, lets a user pin a process to specific cores with `taskset`. Same machine, same binary, three placements:
+
+| Placement on `wolf` | Throughput | p50 | p90 | p95 | p99 | p99.9 | max | Throughput spread |
+|---|---|---|---|---|---|---|---|---|
+| A. unpinned | 6.6M msg/s | 70 ns | 170 ns | 200 ns | 290 ns | 460 ns | 28 µs | 5.43–6.74M |
+| B. `taskset -c 1` (both threads share one core) | **10.2M msg/s** | **60 ns** | **90 ns** | 150 ns | **230 ns** | **390 ns** | 133 µs | **9.97–10.20M** |
+| C. `taskset -c 2,3` (one core per thread) | 6.8M msg/s | 70 ns | 170 ns | 200 ns | 300 ns | 460 ns | 186 µs | 6.52–7.13M |
+
+- **One shared core was the fastest and most repeatable**, with 1.5× the throughput, a lower tail, and only 2% run-to-run variation. With both threads on one core, each message the ingress thread writes is still in that core's own cache when the matcher reads it. On two cores (A and C), every message's cache line has to move between cores first, and that transfer costs more than the two threads taking turns.
+- **That number flatters B.** The benchmark times only how long each message takes to process, not how long it waited in the queue. On a shared core, the matcher can't run while the ingress thread holds the CPU, so messages pile up in the queue. For a live feed, that waiting time is exactly the latency that matters, and this harness doesn't measure it. B's 133 µs worst case is the visible sign: most likely the matcher being paused partway through a message.
+- **Pinning to separate cores (C) changed nothing compared with unpinned (A).** `taskset` only restricts where *this* process may run; it doesn't keep other users' work, kernel threads, or interrupts off cores 2 and 3. A truly quiet core needs `isolcpus` / `nohz_full` and moving interrupts elsewhere, all of which need root and weren't available on a shared lab server. So these runs show what pinning does on a busy machine, not what full core isolation would do.
+
 ### Component benchmarks — [`tests/test_benchmark.cpp`](tests/test_benchmark.cpp)
 
-| Scenario | M4 Pro | M1 |
-|---|---|---|
-| Resting insert, 10,000 orders across 500 levels | p50 ≈ 42 ns, p99 ≈ 84 ns | p50 ≈ 125 ns, p99 ≈ 167 ns |
-| Single taker sweeping ~250 levels / 5,000 resting orders (50,000 units) | ≈ 39–40 µs (≈ 8 ns per resting order consumed) | ≈ 99 µs (≈ 20 ns per resting order consumed) |
+| Scenario | M4 Pro | M1 | EPYC 74F3 (Linux) |
+|---|---|---|---|
+| Resting insert, 10,000 orders across 500 levels | p50 ≈ 42 ns, p99 ≈ 84 ns | p50 ≈ 125 ns, p99 ≈ 167 ns | p50 ≈ 60 ns, p99 ≈ 80 ns |
+| Single taker sweeping ~250 levels / 5,000 resting orders (50,000 units) | ≈ 39–40 µs (≈ 8 ns per resting order consumed) | ≈ 99 µs (≈ 20 ns per resting order consumed) | ≈ 65 µs (≈ 13 ns per resting order consumed) |
 
 ### Reading the distribution
 
-- **Timer resolution sets the floor.** Both chips' counters run at 24 MHz (`hw.tbfrequency`), so one tick is about 41.67 ns and every sample is a whole number of ticks. The M4 Pro's p50 of 42 ns means "within one tick", and about 5% of its samples read 0 ns (they finished inside a single tick), so its true median is likely somewhat lower. The M1's p50 of 125 ns is three ticks, so the M1's median gap is real, but it is still only resolved to ±1 tick. `plot_latency.py` bins on the detected tick to avoid aliasing artifacts.
-- **The tail shoulder is the OS, not the engine.** The CCDF has a small plateau between roughly 1 and 4 µs, at a frequency of about 10⁻⁵ to 10⁻⁴ depending on the run. The hot path does no allocation and no locking, so this is consistent with scheduler preemption, interrupts, or first-touch page faults landing inside a sample. QoS elevation reduces how often this happens but cannot eliminate it on macOS.
+- **Timer resolution sets the floor.** Both chips' counters run at 24 MHz (`hw.tbfrequency`), so one tick is about 41.67 ns and every sample is a whole number of ticks. The M4 Pro's p50 of 42 ns means "within one tick", and about 5% of its samples read 0 ns (they finished inside a single tick), so its true median is likely somewhat lower. The M1's p50 of 125 ns is three ticks, so the M1's median gap is real, but it is still only resolved to ±1 tick. On Linux the engine reads `steady_clock` instead, whose readings came in 10 ns steps. `plot_latency.py` bins on the detected step to avoid aliasing artifacts.
+- **The rare slow outliers come from the OS, not the engine.** The Mac CCDF has a small plateau between roughly 1 and 4 µs, at a frequency of about 10⁻⁵ to 10⁻⁴ depending on the run, and the Linux maxima reach 28–186 µs. The hot path does no allocation and no locking, so these are consistent with scheduler preemption, interrupts, or first-touch page faults landing inside a sample. QoS elevation on macOS and `taskset` on Linux change how often this happens, but neither can eliminate it without full core isolation.
 
 Regenerate the figure yourself:
 
@@ -172,7 +195,7 @@ python3 scripts/plot_latency.py latency.csv --warmup-fraction 0 -o /tmp/latency_
 
 ## Building, testing, and running
 
-Requires CMake ≥ 3.25 and a C++20 compiler. Catch2 and Google Benchmark are fetched automatically.
+Requires CMake ≥ 3.25 and a C++20 compiler. Catch2 and Google Benchmark are fetched automatically. Tested on macOS (Apple clang 15 and 17, arm64) and Ubuntu 24.04 (GCC 13.3, x86-64). On Linux the NEON path falls back to scalar code and the macOS QoS/affinity calls are no-ops; pin with `taskset` instead.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -203,4 +226,6 @@ cmake --build build -j
 - **Cancels from the wire are parsed but not routed.** Resolving a `CancelOrder` message requires an order-id → pool-index map, which is not implemented yet.
 - **The model is a placeholder.** The linear weights are hand-set to demonstrate branchless, constant-time inference on the hot path. They are not fit to market data and carry no predictive claim.
 - **"Zero allocation" is by construction, not yet by enforcement.** Every hot-path structure is a fixed-size array allocated before the replay starts, but the build does not yet trap stray allocations (for example, with a debug `operator new` override) or run under ThreadSanitizer.
-- **Thread affinity is unavailable on Apple Silicon** (see above). Results reflect QoS elevation only.
+- **Thread affinity is unavailable on Apple Silicon** (see above). Mac results reflect QoS elevation only.
+- **Latency excludes queueing delay.** Each sample covers processing one message, not the time it waited in the SPSC queue. This is why sharing one core looks best on Linux in this benchmark, even though it would delay messages on a live feed.
+- **No isolated-core measurement.** The Linux runs used a shared lab server without root, so `isolcpus` / `nohz_full` were not available. The pinning results reflect a busy machine, not a dedicated trading host.
