@@ -182,3 +182,15 @@ taskset -c 2,3 ./build/src/chronos_replay latency.csv    # one core per thread
 ```
 
 On Linux, the NEON code falls back to scalar code and the macOS thread-priority calls do nothing; use `taskset` for core placement instead.
+
+---
+
+## Why I Built Chronos-ML
+
+As a CS and Data Science student at UofT, I spend most of my time in Python, working with probability, ML models, and high-level algorithms. While I really enjoy that side of computer science, I started feeling like I was relying too much on abstractions. I wanted to understand what actually happens under the hood when code executes, without garbage collectors or high-level frameworks hiding the details.
+
+Because I'm also minoring in Economics and spend much of my free time studying market microstructure and stock movements, building a limit order book made sense. A trading engine isn't just an abstract data structure to me. It's where market expectations and probability meet engineering limits. I wanted to see what it actually takes to execute trades at the nanosecond level.
+
+I like figuring things out from first principles, so I used this project to force myself into dealing with actual hardware constraints. I had to learn how to completely avoid dynamic memory allocation, manage L1 cache locality, and deal with OS thread scheduling jitter. Building this allowed me to take the theoretical math and algorithms I learn in class and apply them directly to low-level C++ performance engineering.
+
+Looking ahead, whether I end up working on AI infrastructure or quantitative trading systems, I know the hardest bottlenecks are going to be physical: things like memory bandwidth, execution latency, and hardware optimization. I built Chronos-ML to make sure I know how to actually build and optimize at that level.
